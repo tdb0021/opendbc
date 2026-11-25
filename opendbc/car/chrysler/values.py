@@ -12,6 +12,9 @@ Ecu = CarParams.Ecu
 class ChryslerSafetyFlags(IntFlag):
   RAM_DT = 1
   RAM_HD = 2
+  # openpilot longitudinal. Off unless the alpha-long toggle is on, and the
+  # panda only honors it in a non-release build (ALLOW_DEBUG).
+  LONG = 4
 
 
 class ChryslerFlags(IntFlag):
@@ -100,6 +103,46 @@ class CAR(Platforms):
 
 
 class CarControllerParams:
+  # Safety ceilings. Must match opendbc/safety/modes/chrysler.h.
+  # Friction-brake decel still uses the openpilot standard of -3.5 m/s^2. The only
+  # stock friction-brake samples on the 2020 HD were about -0.3 m/s^2 and under a second.
+  ACCEL_MIN = -3.5           # m/s^2. Stock friction brake reached -2.75; -3.5 is the usual cap.
+  ACCEL_MAX = 2.0            # m/s^2 controller clip. The planner cap is get_pid_accel_limits.
+  MAX_TORQUE = 740.0         # Nm Ram HD safety ceiling (raw 4960). 937 Nm stock kicks stay outside.
+  MIN_TORQUE = -120.0        # Nm. Deepest stock request was -98 Nm.
+  # Stock "no brake" is raw 4093, which decodes to 3.9943 m/s^2. 4.0 packs to raw 4094.
+  INACTIVE_DECEL = 3.9943
+
+  # Friction brake below this. Clip 2 held a friction brake for 4.4 s down to -2.75.
+  BRAKE_ENTER_ACCEL = -0.25  # m/s^2
+  # Below this decel, also send the GR_MAX_REQ=4 stock used at the bottom of the hard stop.
+  HARD_BRAKE_DECEL = -2.0
+  # Stock ACC was never engaged below 3.6 kph, and standstill/go were never set.
+  # Below this speed the controller drops ACC instead of creeping or holding.
+  LOW_SPEED_HANDBACK = 1.0  # m/s
+
+  # First alpha-long drive, 15-28 m/s, flat, brake off. The ECM tracked the request
+  # and the truck still ran 4-6 m/s under set speed: 0.2-0.35 m/s^2 produced ~0 accel.
+  # Hold was ~160-175 Nm in 5th and ~190-270 Nm in 6th. Gain was ~540 Nm per m/s^2
+  # in 5th and ~710 in 6th. 550 and 200 sit between those gears. No gear term yet.
+  # The planner accel cap is (MAX_TORQUE_CMD - TORQUE_OFFSET) / TORQUE_FROM_ACCEL,
+  # (720 - 200) / 550 ≈ 0.945 m/s^2, where this line reaches the command cap.
+  TORQUE_FROM_ACCEL = 550.0  # Nm / (m/s^2)
+  TORQUE_OFFSET = 200.0      # Nm at 0 m/s^2
+  MIN_TORQUE_CMD = -120.0
+  MAX_TORQUE_CMD = 720.0
+  # The DAS_3 engine torque request may rise at most this fast (decreases are not limited).
+  # A 0.07 -> 0.9 m/s^2 planner ramp used to reach 720 Nm in under 2 s at ~1000 rpm, which
+  # made the transmission kick down. 250 Nm/s is 5 Nm per 50 Hz DAS_3 frame.
+  TORQUE_RISE_RATE = 250.0  # Nm/s
+  # Gas override parks the request here. Stock median was about -90 Nm, MAX bit off.
+  GAS_OVERRIDE_TORQUE = -90.0
+  # Sent with ACC_DECEL. The hard stop held about -75 to -88 Nm.
+  BRAKE_TORQUE = -80.0
+  # DAS_5 wheel-torque raw 0. The packer turns a physical 0 Nm into 0x1E57, which
+  # this truck never sends. -7767 Nm is raw 0, bytes 4-5 = 00 00.
+  WHEEL_TORQUE_INACTIVE = -7767.0
+
   def __init__(self, CP):
     self.STEER_STEP = 2  # 50 Hz
     self.STEER_ERROR_MAX = 80

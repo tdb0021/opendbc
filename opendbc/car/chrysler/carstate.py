@@ -28,6 +28,8 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
       self.shifter_values = can_define.dv["GEAR"]["PRNDL"]
 
     self.distance_button = 0
+    self.stock_acc_active = False
+    self.stock_acc_available = False
 
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
     cp = can_parsers[Bus.pt]
@@ -80,8 +82,18 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     # cruise state
     cp_cruise = cp_cam if self.CP.carFingerprint in RAM_CARS else cp
 
-    ret.cruiseState.available = cp_cruise.vl["DAS_3"]["ACC_AVAILABLE"] == 1
-    ret.cruiseState.enabled = cp_cruise.vl["DAS_3"]["ACC_ACTIVE"] == 1
+    # Raw stock DAS_3 (bus 2 for RAM). available is used as-is, with no hold: the panda
+    # (mads.h) exits lateral on the same falling ACC_AVAILABLE edge, so they have to agree.
+    # It is also what our own DAS_3 ACC_AVAILABLE bit is built from. Do not derive it from
+    # ESP_1 ACC_Enabled, which only echoes our DAS_3.
+    self.stock_acc_available = cp_cruise.vl["DAS_3"]["ACC_AVAILABLE"] == 1
+    # The controller cancels stock ACC from this, without treating it as engaged.
+    self.stock_acc_active = cp_cruise.vl["DAS_3"]["ACC_ACTIVE"] == 1
+    # Stock ACC still sees forwarded buttons and can set ACC_ACTIVE on bus 2.
+    # That frame is not what the powertrain follows while we transmit DAS_3.
+    # Reporting it as enabled makes selfdrived cancel and raise cruiseMismatch.
+    ret.cruiseState.enabled = False if self.CP.openpilotLongitudinalControl else self.stock_acc_active
+    ret.cruiseState.available = self.stock_acc_available
     ret.cruiseState.speed = cp_cruise.vl["DAS_4"]["ACC_SET_SPEED_KPH"] * CV.KPH_TO_MS
     ret.cruiseState.nonAdaptive = cp_cruise.vl["DAS_4"]["ACC_STATE"] in (1, 2)  # 1 NormalCCOn and 2 NormalCCSet
     ret.cruiseState.standstill = cp_cruise.vl["DAS_3"]["ACC_STANDSTILL"] == 1
@@ -113,6 +125,16 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     ]
 
     return ret, ret_sp
+
+  def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
+    # Stock ACC enables from accel/decel. Resume is the other engage button on these trucks,
+    # and safety enters controls_allowed on its falling edge too.
+    if self.CP.openpilotLongitudinalControl and not self.CP.pcmCruise:
+      for b in buttonEvents:
+        if b.type in (ButtonType.accelCruise, ButtonType.decelCruise, ButtonType.resumeCruise) and not b.pressed:
+          return True
+      return False
+    return super().update_button_enable(buttonEvents)
 
   def update_cusw(self, cp, cp_cam):
     ret = structs.CarState()
