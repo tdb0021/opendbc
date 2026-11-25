@@ -12,6 +12,9 @@ Ecu = CarParams.Ecu
 class ChryslerSafetyFlags(IntFlag):
   RAM_DT = 1
   RAM_HD = 2
+  # openpilot longitudinal. Off unless the alpha-long toggle is on, and the
+  # panda only honors it in a non-release build (ALLOW_DEBUG).
+  LONG = 4
 
 
 class ChryslerFlags(IntFlag):
@@ -100,6 +103,27 @@ class CAR(Platforms):
 
 
 class CarControllerParams:
+  # Safety ceilings. Must match opendbc/safety/modes/chrysler.h.
+  # +2.0 / -3.5 m/s^2 is the openpilot standard (also what commaai/panda#1719 encoded
+  # for ACC_DECEL). RamBetaLong used +3.5 / -4.0; those are intentionally not used.
+  ACCEL_MIN = -3.5          # m/s^2, friction brake
+  ACCEL_MAX = 2.0           # m/s^2, planner cap. The torque map below will not reach this on a Cummins.
+  MAX_TORQUE = 500.0        # Nm, safety max on ENGINE_TORQUE_REQUEST
+  INACTIVE_DECEL = 4.0      # m/s^2, ACC_DECEL "no brake request" sentinel
+
+  # UNTUNED. Carried from realfast RamBetaLong (Vincent Wright, through 2023-08-29,
+  # commit 0defa423) as the point where they started requesting brakes. Not validated
+  # on a 2020-24 Ram 2500/3500 or a 1500.
+  BRAKE_ENTER_ACCEL = -0.25  # m/s^2
+
+  # UNTUNED open-loop map. RamBetaLong clipped a kinetic-energy estimate to ±6 Nm and
+  # added measured engine torque. That ±6 Nm delta is NOT used here: if engine torque
+  # tracks the request, adding it back integrates up to the cap. 80 Nm per m/s^2,
+  # hard-capped at 200 Nm, under-actuates a 6.7 Cummins (peak roughly 1000+ Nm) on
+  # purpose until ENGINE_TORQUE is logged against vehicle accel. Safety still allows 500 Nm.
+  TORQUE_FROM_ACCEL = 80.0   # Nm / (m/s^2)
+  MAX_TORQUE_CMD = 200.0     # Nm, controller cap, below MAX_TORQUE
+
   def __init__(self, CP):
     self.STEER_STEP = 2  # 50 Hz
     self.STEER_ERROR_MAX = 80

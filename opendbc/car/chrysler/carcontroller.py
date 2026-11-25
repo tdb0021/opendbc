@@ -1,14 +1,15 @@
 from opendbc.can import CANPacker
-from opendbc.car import Bus, DT_CTRL
-from opendbc.car.lateral import apply_meas_steer_torque_limits
+from opendbc.car import Bus, DT_CTRL, structs
 from opendbc.car.chrysler import chryslercan
-from opendbc.car.chrysler.values import CUSW_CARS, RAM_CARS, CarControllerParams, ChryslerFlags, RAM_DT
+from opendbc.car.chrysler.values import RAM_DT, RAM_CARS, CUSW_CARS, CarControllerParams, ChryslerFlags
 from opendbc.car.interfaces import CarControllerBase
-
+from opendbc.car.lateral import apply_meas_steer_torque_limits
 from opendbc.sunnypilot.car.chrysler.carcontroller_ext import CarControllerExt
 from opendbc.sunnypilot.car.chrysler.icbm import IntelligentCruiseButtonManagementInterface
 from opendbc.sunnypilot.car.chrysler.mads import MadsCarController
 from opendbc.sunnypilot.car.chrysler.values_ext import ChryslerFlagsSP
+
+LongCtrlState = structs.CarControl.Actuators.LongControlState
 
 
 class CarController(CarControllerBase, MadsCarController, CarControllerExt, IntelligentCruiseButtonManagementInterface):
@@ -26,6 +27,7 @@ class CarController(CarControllerBase, MadsCarController, CarControllerExt, Inte
 
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.params = CarControllerParams(CP)
+    self.accel = 0.0
 
   def update(self, CC, CC_SP, CS, now_nanos):
     MadsCarController.update(self, CC, CC_SP, CS)
@@ -95,10 +97,71 @@ class CarController(CarControllerBase, MadsCarController, CarControllerExt, Inte
     # Intelligent Cruise Button Management
     can_sends.extend(IntelligentCruiseButtonManagementInterface.update(self, CS, CC_SP, self.packer, self.frame, self.last_button_frame))
 
+    if self.CP.openpilotLongitudinalControl:
+      can_sends.extend(self._long_control_messages(CC, CS))
+
     self.frame += 1
 
     new_actuators = CC.actuators.as_builder()
     new_actuators.torque = self.apply_torque_last / self.params.STEER_MAX
     new_actuators.torqueOutputCan = self.apply_torque_last
+    new_actuators.accel = self.accel
 
     return new_actuators, can_sends
+
+  def _long_control_messages(self, CC, CS):
+    # Gas or brake from the driver: send the inactive frame so the last torque request
+    # cannot latch. Safety also blocks a non-inactive frame while the pedal is down.
+    pedals = CS.out.gasPressed or CS.out.brakePressed
+    if not CC.longActive or pedals:
+      self.accel = 0.0
+      active = False
+      torque = 0.0
+      torque_active = False
+      decel = CarControllerParams.INACTIVE_DECEL
+      decel_active = False
+      standstill = False
+      go = False
+    else:
+      accel = float(CC.actuators.accel)
+      if CC.actuators.longControlState == LongCtrlState.stopping:
+        accel = min(accel, CarControllerParams.BRAKE_ENTER_ACCEL)
+      braking = accel <= CarControllerParams.BRAKE_ENTER_ACCEL
+      if braking:
+        self.accel = max(CarControllerParams.ACCEL_MIN, accel)
+        torque = 0.0
+        torque_active = False
+        decel = self.accel
+        decel_active = True
+      elif accel > 0.0:
+        self.accel = min(accel, CarControllerParams.ACCEL_MAX)
+        torque = min(CarControllerParams.MAX_TORQUE_CMD, self.accel * CarControllerParams.TORQUE_FROM_ACCEL)
+        torque_active = torque > 0.0
+        decel = CarControllerParams.INACTIVE_DECEL
+        decel_active = False
+      else:
+        # Coast between BRAKE_ENTER_ACCEL and 0. UNTUNED, from RamBetaLong's -0.25 threshold.
+        self.accel = 0.0
+        torque = 0.0
+        torque_active = False
+        decel = CarControllerParams.INACTIVE_DECEL
+        decel_active = False
+      active = True
+      standstill = CC.actuators.longControlState == LongCtrlState.stopping and CS.out.standstill
+      go = CC.actuators.longControlState == LongCtrlState.starting and not braking
+
+    sends = []
+    # DAS_3 / DAS_5 at 50 Hz. Stock ACC is about that rate; the counter increments per send.
+    if self.frame % 2 == 0:
+      sends.append(chryslercan.create_das_3(self.packer, active, torque, decel, torque_active, decel_active, standstill, go))
+      sends.append(chryslercan.create_das_5(self.packer, CC.hudControl.setSpeed))
+    # Cluster message slower. RamBetaLong sent this every 6 frames; 10 Hz is enough for a display.
+    if self.frame % 10 == 0:
+      if active and CC.actuators.longControlState != LongCtrlState.off:
+        acc_state = 2
+      elif CC.enabled:
+        acc_state = 1
+      else:
+        acc_state = 0
+      sends.append(chryslercan.create_das_4(self.packer, acc_state, CC.hudControl.setSpeed))
+    return sends

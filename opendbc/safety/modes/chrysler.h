@@ -8,7 +8,9 @@
 #define CHRYSLER_ESP_1            0x140  // Brake pedal and vehicle speed
 #define CHRYSLER_ESP_8            0x11C  // Brake pedal and vehicle speed
 #define CHRYSLER_ECM_5            0x22F  // Throttle position sensor
-#define CHRYSLER_DAS_3            0x1F4  // ACC engagement states from DASM
+#define CHRYSLER_DAS_3            0x1F4  // ACC state, engine-torque and decel from DASM
+#define CHRYSLER_DAS_4            0x1F5  // ACC / FCW display from DASM
+#define CHRYSLER_DAS_5            0x271  // ACC display and wheel-torque request from DASM
 #define CHRYSLER_DAS_6            0x2A6  // LKAS HUD and auto headlight control from DASM
 #define CHRYSLER_LKAS_COMMAND     0x292  // LKAS controls from DASM
 #define CHRYSLER_CRUISE_BUTTONS   0x23B  // Cruise control buttons
@@ -23,6 +25,8 @@
 #define CHRYSLER_RAM_DT_ESP_8            0x79
 #define CHRYSLER_RAM_DT_ECM_5            0x9D
 #define CHRYSLER_RAM_DT_DAS_3            0x99
+#define CHRYSLER_RAM_DT_DAS_4            0xE8
+#define CHRYSLER_RAM_DT_DAS_5            0xA3
 #define CHRYSLER_RAM_DT_DAS_6            0xFA
 #define CHRYSLER_RAM_DT_LKAS_COMMAND     0xA6
 #define CHRYSLER_RAM_DT_CRUISE_BUTTONS   0xB1
@@ -37,6 +41,8 @@
 #define CHRYSLER_RAM_HD_ESP_8            0x11C
 #define CHRYSLER_RAM_HD_ECM_5            0x22F
 #define CHRYSLER_RAM_HD_DAS_3            0x1F4
+#define CHRYSLER_RAM_HD_DAS_4            0x1F5
+#define CHRYSLER_RAM_HD_DAS_5            0x271
 #define CHRYSLER_RAM_HD_DAS_6            0x275
 #define CHRYSLER_RAM_HD_LKAS_COMMAND     0x276
 #define CHRYSLER_RAM_HD_CRUISE_BUTTONS   0x23A
@@ -57,12 +63,37 @@ typedef enum {
   CHRYSLER_PACIFICA,  // plus Jeep
 } ChryslerPlatform;
 static ChryslerPlatform chrysler_platform;
+static bool chrysler_longitudinal = false;
+// Driver cruise buttons are on bus 0. Ram HD trucks use either 0x23A or 0x23B.
+static uint32_t chrysler_cruise_button_addr = 0U;
 
 #define CHRYSLER_ADDR(name) ((uint32_t)((chrysler_platform == CHRYSLER_RAM_DT) ? CHRYSLER_RAM_DT_##name : \
                                         ((chrysler_platform == CHRYSLER_RAM_HD) ? CHRYSLER_RAM_HD_##name : CHRYSLER_##name)))
 
+// Cruise-button bits in byte 0. Matches the DBC (ACC_Cancel/Accel/Decel/Resume).
+#define CHRYSLER_BTN_CANCEL  1U
+#define CHRYSLER_BTN_ACCEL   4U
+#define CHRYSLER_BTN_DECEL   8U
+#define CHRYSLER_BTN_RESUME  16U
+#define CHRYSLER_BTN_ENABLE  (CHRYSLER_BTN_ACCEL | CHRYSLER_BTN_DECEL | CHRYSLER_BTN_RESUME)
+
+// DAS_3 ENGINE_TORQUE_REQUEST: 13-bit Motorola at bit 4, 0.25 Nm, offset -500.
+// 2000 = 0 Nm (inactive). 4000 = 500 Nm. Negative torque is not allowed.
+#define CHRYSLER_TORQUE_INACTIVE  2000
+#define CHRYSLER_TORQUE_MAX       4000
+// DAS_3 ACC_DECEL: 12-bit Motorola at bit 19, 0.004885 m/s^2, offset -16.
+// Packer outputs: -3.5 -> 2559, 0.0 -> 3275, +4.0 (no-brake sentinel) -> 4094.
+#define CHRYSLER_DECEL_MIN        2559
+#define CHRYSLER_DECEL_MAX        3275
+#define CHRYSLER_DECEL_INACTIVE   4094
+// DAS_5 WHEEL_TORQUE_REQUEST inactive raw for 0 Nm (offset -7767). Not an actuation path.
+#define CHRYSLER_WHEEL_TORQUE_INACTIVE_HI  0x1EU
+#define CHRYSLER_WHEEL_TORQUE_INACTIVE_LO  0x57U
+
 static uint8_t chrysler_get_counter(const CANPacket_t *msg) {
-  return (uint8_t)(msg->data[6] >> 4);
+  // High nibble of the byte before the checksum. 8-byte msgs: byte 6. 3-byte cruise buttons: byte 1.
+  int counter_byte = GET_LEN(msg) - 2;
+  return (uint8_t)(msg->data[counter_byte] >> 4);
 }
 
 static void chrysler_rx_hook(const CANPacket_t *msg) {
@@ -72,12 +103,37 @@ static void chrysler_rx_hook(const CANPacket_t *msg) {
     update_sample(&torque_meas, torque_meas_new);
   }
 
-  // enter controls on rising edge of ACC, exit controls on ACC off
-  const unsigned int das_3_bus = (chrysler_platform == CHRYSLER_PACIFICA) ? 0U : 2U;
-  if (msg_matches(msg, CHRYSLER_ADDR(DAS_3), das_3_bus)) {
-    bool cruise_engaged = GET_BIT(msg, 21U);
-    pcm_cruise_check(cruise_engaged);
-    acc_main_on = GET_BIT(msg, 20U);
+  if (chrysler_longitudinal) {
+    // openpilot longitudinal engages from the driver's buttons, not from stock ACC.
+    // Falling edge of resume/accel/decel enters; cancel exits. Gas blocks actuation
+    // via get_longitudinal_allowed(); brake exits in generic_rx_checks.
+    if (msg_matches(msg, chrysler_cruise_button_addr, 0U)) {
+      const uint8_t raw_btn = msg->data[0];
+      const bool cancel = (raw_btn & CHRYSLER_BTN_CANCEL) != 0U;
+      const uint8_t cruise_button = cancel ? (uint8_t)CHRYSLER_BTN_CANCEL : (uint8_t)(raw_btn & CHRYSLER_BTN_ENABLE);
+
+      if (cancel) {
+        controls_allowed = false;
+      }
+
+      const bool falling_enable = !cancel &&
+                                  (cruise_button != cruise_button_prev) &&
+                                  ((cruise_button_prev == CHRYSLER_BTN_ACCEL) ||
+                                   (cruise_button_prev == CHRYSLER_BTN_DECEL) ||
+                                   (cruise_button_prev == CHRYSLER_BTN_RESUME));
+      if (falling_enable) {
+        controls_allowed = true;
+      }
+      cruise_button_prev = cruise_button;
+    }
+  } else {
+    // enter controls on rising edge of ACC, exit controls on ACC off
+    const unsigned int das_3_bus = (chrysler_platform == CHRYSLER_PACIFICA) ? 0U : 2U;
+    if (msg_matches(msg, CHRYSLER_ADDR(DAS_3), das_3_bus)) {
+      bool cruise_engaged = GET_BIT(msg, 21U);
+      pcm_cruise_check(cruise_engaged);
+      acc_main_on = GET_BIT(msg, 20U);
+    }
   }
 
   // TODO: use the same message for both
@@ -157,6 +213,83 @@ static bool chrysler_tx_hook(const CANPacket_t *msg) {
     }
   }
 
+  // Longitudinal actuation. DAS_3 is engine torque (accel) and ACC_DECEL (brake, m/s^2).
+  // Limits match the openpilot standard of +2.0 / -3.5 m/s^2 on the brake signal and
+  // cap engine torque at 500 Nm, which is well under a 6.7 Cummins peak (~1000+ Nm)
+  // and under the signal maximum (1547.5 Nm). 0 Nm is the only inactive torque.
+  // The +4.0 m/s^2 ACC_DECEL value is the stock "no brake request" sentinel, not an accel command.
+  if (msg->addr == CHRYSLER_ADDR(DAS_3)) {
+    const LongitudinalLimits CHRYSLER_LONG_LIMITS = {
+      .max_gas = CHRYSLER_TORQUE_MAX,
+      .min_gas = CHRYSLER_TORQUE_INACTIVE,
+      .inactive_gas = CHRYSLER_TORQUE_INACTIVE,
+      .max_accel = CHRYSLER_DECEL_MAX,
+      .min_accel = CHRYSLER_DECEL_MIN,
+      .inactive_accel = CHRYSLER_DECEL_INACTIVE,
+    };
+
+    const int torque = ((msg->data[0] & 0x1FU) << 8) | msg->data[1];
+    const int decel = ((msg->data[2] & 0x0FU) << 8) | msg->data[3];
+    const bool torque_req = GET_BIT(msg, 7U);
+    const uint8_t decel_req = (uint8_t)((msg->data[4] >> 4) & 0x7U);
+    const bool torque_inactive = torque == CHRYSLER_LONG_LIMITS.inactive_gas;
+    const bool decel_inactive = decel == CHRYSLER_LONG_LIMITS.inactive_accel;
+
+    bool violation = false;
+    violation |= longitudinal_gas_checks(torque, CHRYSLER_LONG_LIMITS);
+    violation |= longitudinal_accel_checks(decel, CHRYSLER_LONG_LIMITS);
+    // Never request engine torque and friction braking on the same frame.
+    violation |= !torque_inactive && !decel_inactive;
+    // Request bits have to match the values. The ECU may honor either.
+    violation |= torque_req != !torque_inactive;
+    violation |= (decel_req != 0U) != !decel_inactive;
+    violation |= decel_req > 1U;
+    // Unused or unvalidated actuation bits stay clear.
+    violation |= (msg->data[2] & 0xC0U) != 0U;   // bit 22 unused, DISABLE_FUEL_SHUTOFF
+    violation |= (msg->data[4] & 0x0FU) != 0U;   // GR_MAX_REQ
+    violation |= (msg->data[4] & 0x80U) != 0U;   // unused
+    violation |= msg->data[5] != 0U;             // ACC_FAULTED
+    violation |= (msg->data[6] & 0x0FU) != 0U;   // COLLISION_BRK_PREP, ACC_BRK_PREP, unused
+    if (!get_longitudinal_allowed()) {
+      violation |= GET_BIT(msg, 5U);             // ACC_STANDSTILL
+      violation |= GET_BIT(msg, 6U);             // ACC_GO
+      violation |= GET_BIT(msg, 21U);            // ACC_ACTIVE
+    }
+
+    if (violation) {
+      tx = false;
+    }
+  }
+
+  // DAS_5 carries WHEEL_TORQUE_REQUEST. That path is not used; only the inactive value is allowed.
+  // Byte 3 is the cluster set speed. Bytes 0-2 are FCW flags and stay clear.
+  if (msg->addr == CHRYSLER_ADDR(DAS_5)) {
+    bool violation = false;
+    violation |= msg->data[0] != 0U;
+    violation |= msg->data[1] != 0U;
+    violation |= msg->data[2] != 0U;
+    violation |= msg->data[4] != CHRYSLER_WHEEL_TORQUE_INACTIVE_HI;
+    violation |= msg->data[5] != CHRYSLER_WHEEL_TORQUE_INACTIVE_LO;
+    violation |= (msg->data[6] & 0x0FU) != 0U;
+    if (violation) {
+      tx = false;
+    }
+  }
+
+  // DAS_4 is the cluster / FCW display. FCW braking bits are rejected.
+  // Bytes 1-2 are set speed, byte 7 is the digital speed, byte 4 bits 4-6 are ACC_STATE.
+  if (msg->addr == CHRYSLER_ADDR(DAS_4)) {
+    bool violation = false;
+    violation |= msg->data[0] != 0U;
+    violation |= msg->data[3] != 0U;
+    violation |= (msg->data[4] & 0x8FU) != 0U;
+    violation |= msg->data[5] != 0U;
+    violation |= msg->data[6] != 0U;
+    if (violation) {
+      tx = false;
+    }
+  }
+
   // FORCE CANCEL: only the cancel button press is allowed
   if ((msg->addr == CHRYSLER_ADDR(CRUISE_BUTTONS)) || (msg->addr == CHRYSLER_ADDR(CRUISE_BUTTONS_ALT))) {
     const bool is_cancel = msg->data[0] == 1U;
@@ -174,6 +307,15 @@ static bool chrysler_tx_hook(const CANPacket_t *msg) {
 
 static safety_config chrysler_init(uint16_t param) {
   const uint32_t CHRYSLER_PARAM_RAM_DT = 1U;  // set for Ram DT platform
+
+  // Longitudinal is unvalidated. Same gate as other experimental long modes:
+  // only a non-release panda (ALLOW_DEBUG) honors the flag. Stock behavior is unchanged.
+#ifdef ALLOW_DEBUG
+  const uint32_t CHRYSLER_PARAM_LONGITUDINAL = 4U;
+  chrysler_longitudinal = GET_FLAG(param, CHRYSLER_PARAM_LONGITUDINAL);
+#else
+  chrysler_longitudinal = false;
+#endif
 
   static RxCheck chrysler_ram_dt_rx_checks[] = {
     {.msg = {{CHRYSLER_RAM_DT_EPS_2, 0, 8, 100U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
@@ -207,6 +349,25 @@ static safety_config chrysler_init(uint16_t param) {
   };
 
 #ifdef ALLOW_DEBUG
+  // Driver buttons replace stock DAS_3 as the engagement source. Stock ACC state is not trusted.
+  static RxCheck chrysler_long_rx_checks[] = {
+    {.msg = {{CHRYSLER_EPS_2, 0, 8, 100U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_ESP_1, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{514, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_ECM_5, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_CRUISE_BUTTONS, 0, 3, 20U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_TRACTION_BUTTON, 0, 8, 1U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},
+  };
+
+  static RxCheck chrysler_ram_dt_long_rx_checks[] = {
+    {.msg = {{CHRYSLER_RAM_DT_EPS_2, 0, 8, 100U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_DT_ESP_1, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_DT_ESP_8, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_DT_ECM_5, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_DT_CRUISE_BUTTONS, 0, 3, 20U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_DT_Center_Stack_2, 0, 8, 1U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},
+  };
+
   static RxCheck chrysler_ram_hd_rx_checks[] = {
     {.msg = {{CHRYSLER_RAM_HD_EPS_2, 0, 8, 100U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_HD_ESP_1, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
@@ -214,6 +375,43 @@ static safety_config chrysler_init(uint16_t param) {
     {.msg = {{CHRYSLER_RAM_HD_ECM_5, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_HD_DAS_3, 2, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_HD_Center_Stack_2, 0, 8, 1U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},
+  };
+
+  static RxCheck chrysler_ram_hd_long_rx_checks[] = {
+    {.msg = {{CHRYSLER_RAM_HD_EPS_2, 0, 8, 100U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_ESP_1, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_ESP_8, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_ECM_5, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_CRUISE_BUTTONS, 0, 3, 20U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_Center_Stack_2, 0, 8, 1U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},
+  };
+
+  static RxCheck chrysler_ram_hd_alt_long_rx_checks[] = {
+    {.msg = {{CHRYSLER_RAM_HD_EPS_2, 0, 8, 100U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_ESP_1, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_ESP_8, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_ECM_5, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_CRUISE_BUTTONS_ALT, 0, 3, 20U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_Center_Stack_2, 0, 8, 1U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},
+  };
+
+  static const CanMsg CHRYSLER_LONG_TX_MSGS[] = {
+    {CHRYSLER_CRUISE_BUTTONS, 0, 3, .check_relay = false},
+    {CHRYSLER_LKAS_COMMAND, 0, 6, .check_relay = true},
+    {CHRYSLER_DAS_6, 0, 8, .check_relay = true},
+    {CHRYSLER_LKAS_HEARTBIT, 0, 5, .check_relay = true},
+    {CHRYSLER_DAS_3, 0, 8, .check_relay = true},
+    {CHRYSLER_DAS_4, 0, 8, .check_relay = true},
+    {CHRYSLER_DAS_5, 0, 8, .check_relay = true},
+  };
+
+  static const CanMsg CHRYSLER_RAM_DT_LONG_TX_MSGS[] = {
+    {CHRYSLER_RAM_DT_CRUISE_BUTTONS, 2, 3, .check_relay = false},
+    {CHRYSLER_RAM_DT_LKAS_COMMAND, 0, 8, .check_relay = true},
+    {CHRYSLER_RAM_DT_DAS_6, 0, 8, .check_relay = true},
+    {CHRYSLER_RAM_DT_DAS_3, 0, 8, .check_relay = true},
+    {CHRYSLER_RAM_DT_DAS_4, 0, 8, .check_relay = true},
+    {CHRYSLER_RAM_DT_DAS_5, 0, 8, .check_relay = true},
   };
 
   const uint32_t CHRYSLER_PARAM_RAM_HD = 2U;  // set for Ram HD platform
@@ -228,7 +426,16 @@ static safety_config chrysler_init(uint16_t param) {
 
   if (enable_ram_dt) {
     chrysler_platform = CHRYSLER_RAM_DT;
+    chrysler_cruise_button_addr = CHRYSLER_RAM_DT_CRUISE_BUTTONS;
+#ifdef ALLOW_DEBUG
+    if (chrysler_longitudinal) {
+      ret = BUILD_SAFETY_CFG(chrysler_ram_dt_long_rx_checks, CHRYSLER_RAM_DT_LONG_TX_MSGS);
+    } else {
+      ret = BUILD_SAFETY_CFG(chrysler_ram_dt_rx_checks, CHRYSLER_RAM_DT_TX_MSGS);
+    }
+#else
     ret = BUILD_SAFETY_CFG(chrysler_ram_dt_rx_checks, CHRYSLER_RAM_DT_TX_MSGS);
+#endif
 #ifdef ALLOW_DEBUG
   } else if (enable_ram_hd) {
     static const CanMsg CHRYSLER_RAM_HD_TX_MSGS[] = {
@@ -241,17 +448,53 @@ static safety_config chrysler_init(uint16_t param) {
       {CHRYSLER_RAM_HD_CRUISE_BUTTONS_ALT, 2, 3, .check_relay = false},
     };
 
+    static const CanMsg CHRYSLER_RAM_HD_LONG_TX_MSGS[] = {
+      CHRYSLER_RAM_HD_COMMON_TX_MSGS
+      {CHRYSLER_RAM_HD_CRUISE_BUTTONS, 2, 3, .check_relay = false},
+      {CHRYSLER_RAM_HD_DAS_3, 0, 8, .check_relay = true},
+      {CHRYSLER_RAM_HD_DAS_4, 0, 8, .check_relay = true},
+      {CHRYSLER_RAM_HD_DAS_5, 0, 8, .check_relay = true},
+    };
+
+    static const CanMsg CHRYSLER_RAM_HD_ALT_BUTTONS_LONG_TX_MSGS[] = {
+      CHRYSLER_RAM_HD_COMMON_TX_MSGS
+      {CHRYSLER_RAM_HD_CRUISE_BUTTONS_ALT, 2, 3, .check_relay = false},
+      {CHRYSLER_RAM_HD_DAS_3, 0, 8, .check_relay = true},
+      {CHRYSLER_RAM_HD_DAS_4, 0, 8, .check_relay = true},
+      {CHRYSLER_RAM_HD_DAS_5, 0, 8, .check_relay = true},
+    };
+
     chrysler_platform = CHRYSLER_RAM_HD;
-    SET_RX_CHECKS(chrysler_ram_hd_rx_checks, ret);
-    if (ram_hd_alt_buttons) {
-      SET_TX_MSGS(CHRYSLER_RAM_HD_ALT_BUTTONS_TX_MSGS, ret);
+    chrysler_cruise_button_addr = ram_hd_alt_buttons ? CHRYSLER_RAM_HD_CRUISE_BUTTONS_ALT : CHRYSLER_RAM_HD_CRUISE_BUTTONS;
+    if (chrysler_longitudinal) {
+      if (ram_hd_alt_buttons) {
+        SET_RX_CHECKS(chrysler_ram_hd_alt_long_rx_checks, ret);
+        SET_TX_MSGS(CHRYSLER_RAM_HD_ALT_BUTTONS_LONG_TX_MSGS, ret);
+      } else {
+        SET_RX_CHECKS(chrysler_ram_hd_long_rx_checks, ret);
+        SET_TX_MSGS(CHRYSLER_RAM_HD_LONG_TX_MSGS, ret);
+      }
     } else {
-      SET_TX_MSGS(CHRYSLER_RAM_HD_TX_MSGS, ret);
+      SET_RX_CHECKS(chrysler_ram_hd_rx_checks, ret);
+      if (ram_hd_alt_buttons) {
+        SET_TX_MSGS(CHRYSLER_RAM_HD_ALT_BUTTONS_TX_MSGS, ret);
+      } else {
+        SET_TX_MSGS(CHRYSLER_RAM_HD_TX_MSGS, ret);
+      }
     }
 #endif
   } else {
     chrysler_platform = CHRYSLER_PACIFICA;
+    chrysler_cruise_button_addr = CHRYSLER_CRUISE_BUTTONS;
+#ifdef ALLOW_DEBUG
+    if (chrysler_longitudinal) {
+      ret = BUILD_SAFETY_CFG(chrysler_long_rx_checks, CHRYSLER_LONG_TX_MSGS);
+    } else {
+      ret = BUILD_SAFETY_CFG(chrysler_rx_checks, CHRYSLER_TX_MSGS);
+    }
+#else
     ret = BUILD_SAFETY_CFG(chrysler_rx_checks, CHRYSLER_TX_MSGS);
+#endif
   }
   return ret;
 }

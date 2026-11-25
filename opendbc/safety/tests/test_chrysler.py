@@ -159,5 +159,194 @@ class TestChryslerRamHDAltButtonSafety(TestChryslerRamHDSafety):
     return self.packer.make_can_msg_safety("CRUISE_BUTTONS_ALT", self.DAS_BUS, values)
 
 
+class ChryslerLongitudinalSafetyBase:
+  """openpilot longitudinal: engine torque for accel, ACC_DECEL (m/s^2) for brake.
+
+  Stock ACC does not engage. Resume, accel and decel do, on the falling edge.
+  Cancel, and the brake pedal, disengage. Gas is an override: controls_allowed stays
+  set so lateral can continue, but longitudinal commands must be the inactive values.
+  """
+
+  MIN_ENGINE_TORQUE = 0.0
+  MAX_ENGINE_TORQUE = 500.0
+  INACTIVE_ENGINE_TORQUE = 0.0
+  MIN_POSSIBLE_ENGINE_TORQUE = -500.0
+  MAX_POSSIBLE_ENGINE_TORQUE = 1547.5
+
+  MIN_DECEL = -3.5
+  MAX_DECEL = 0.0
+  INACTIVE_DECEL = 4.0
+  MIN_POSSIBLE_DECEL = -16.0
+  # Just above the +4.0 sentinel so the inactive value is inside the sampled range.
+  MAX_POSSIBLE_DECEL = 4.01
+
+  BUTTON_MSG = "CRUISE_BUTTONS"
+  LONG_BUS = 0
+
+  def test_disable_control_allowed_from_cruise(self):
+    pass
+
+  def test_enable_control_allowed_from_cruise(self):
+    pass
+
+  def test_cruise_engaged_prev(self):
+    pass
+
+  def _rx_button_msg(self, cancel=False, resume=False, accel=False, decel=False):
+    values = {"ACC_Cancel": cancel, "ACC_Resume": resume, "ACC_Accel": accel, "ACC_Decel": decel}
+    return self.packer.make_can_msg_safety(self.BUTTON_MSG, 0, values)
+
+  def _torque_msg(self, torque):
+    values = {
+      "ENGINE_TORQUE_REQUEST": torque,
+      "ENGINE_TORQUE_REQUEST_MAX": 0 if torque == self.INACTIVE_ENGINE_TORQUE else 1,
+      "ACC_DECEL": self.INACTIVE_DECEL,
+      "ACC_DECEL_REQ": 0,
+    }
+    return self.packer.make_can_msg_safety("DAS_3", self.LONG_BUS, values)
+
+  def _decel_msg(self, decel):
+    braking = decel != self.INACTIVE_DECEL
+    values = {
+      "ENGINE_TORQUE_REQUEST": self.INACTIVE_ENGINE_TORQUE,
+      "ENGINE_TORQUE_REQUEST_MAX": 0,
+      "ACC_DECEL": decel,
+      "ACC_DECEL_REQ": 1 if braking else 0,
+    }
+    return self.packer.make_can_msg_safety("DAS_3", self.LONG_BUS, values)
+
+  def _das5_msg(self, wheel_torque=0, wheel_active=0, set_speed=0):
+    values = {
+      "WHEEL_TORQUE_REQUEST": wheel_torque,
+      "WHEEL_TORQUE_REQUEST_ACTIVE": wheel_active,
+      "SET_SPEED_KPH": set_speed,
+    }
+    return self.packer.make_can_msg_safety("DAS_5", self.LONG_BUS, values)
+
+  def _das4_msg(self, fcw_brake=0, acc_state=0, set_speed_kph=0):
+    values = {
+      "FCW_BRAKE_ENABLED": fcw_brake,
+      "ACC_STATE": acc_state,
+      "ACC_SET_SPEED_KPH": set_speed_kph,
+    }
+    return self.packer.make_can_msg_safety("DAS_4", self.LONG_BUS, values)
+
+  def test_torque_limits(self):
+    self._generic_limit_safety_check(self._torque_msg, self.MIN_ENGINE_TORQUE, self.MAX_ENGINE_TORQUE,
+                                     self.MIN_POSSIBLE_ENGINE_TORQUE, self.MAX_POSSIBLE_ENGINE_TORQUE,
+                                     test_delta=1, inactive_value=self.INACTIVE_ENGINE_TORQUE)
+
+  def test_decel_limits(self):
+    self._generic_limit_safety_check(self._decel_msg, self.MIN_DECEL, self.MAX_DECEL,
+                                     self.MIN_POSSIBLE_DECEL, self.MAX_POSSIBLE_DECEL,
+                                     test_delta=0.1, inactive_value=self.INACTIVE_DECEL)
+
+  def test_no_torque_and_brake_together(self):
+    self.safety.set_controls_allowed(True)
+    values = {
+      "ENGINE_TORQUE_REQUEST": 100,
+      "ENGINE_TORQUE_REQUEST_MAX": 1,
+      "ACC_DECEL": -1.0,
+      "ACC_DECEL_REQ": 1,
+    }
+    self.assertFalse(self._tx(self.packer.make_can_msg_safety("DAS_3", self.LONG_BUS, values)))
+
+  def test_gas_override_blocks_longitudinal(self):
+    self.safety.set_controls_allowed(True)
+    self._rx(self._user_gas_msg(1))
+    # Lateral engagement stays; longitudinal actuation does not.
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_longitudinal_allowed())
+    self.assertFalse(self._tx(self._torque_msg(100)))
+    self.assertFalse(self._tx(self._decel_msg(-1.0)))
+    self.assertTrue(self._tx(self._torque_msg(self.INACTIVE_ENGINE_TORQUE)))
+    self._rx(self._user_gas_msg(0))
+    self.assertTrue(self.safety.get_longitudinal_allowed())
+    self.assertTrue(self._tx(self._torque_msg(100)))
+
+  def test_cancel_disengages(self):
+    self.safety.set_controls_allowed(True)
+    self._rx(self._rx_button_msg(cancel=True))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_enable_on_falling_edge(self):
+    for kwargs in ({"resume": True}, {"accel": True}, {"decel": True}):
+      with self.subTest(kwargs=kwargs):
+        self.safety.set_controls_allowed(False)
+        self._rx(self._rx_button_msg())
+        self._rx(self._rx_button_msg(**kwargs))
+        self.assertFalse(self.safety.get_controls_allowed())
+        self._rx(self._rx_button_msg())
+        self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_rising_edge_does_not_enable(self):
+    self.safety.set_controls_allowed(False)
+    self._rx(self._rx_button_msg())
+    self._rx(self._rx_button_msg(resume=True))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_stock_acc_does_not_enable(self):
+    self._rx(self._pcm_status_msg(False))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._rx(self._pcm_status_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_wheel_torque_inactive_only(self):
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._das5_msg(0, 0, set_speed=80)))
+    self.assertFalse(self._tx(self._das5_msg(100, 1)))
+    self.assertFalse(self._tx(self._das5_msg(0, 1)))
+
+  def test_fcw_brake_rejected(self):
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._das4_msg(0, acc_state=2, set_speed_kph=80)))
+    self.assertFalse(self._tx(self._das4_msg(1, acc_state=2, set_speed_kph=80)))
+
+  def test_unvalidated_das3_bits_rejected(self):
+    self.safety.set_controls_allowed(True)
+    for extra in ({"ACC_BRK_PREP": 1}, {"COLLISION_BRK_PREP": 1}, {"GR_MAX_REQ": 1}, {"DISABLE_FUEL_SHUTOFF": 1}):
+      with self.subTest(extra=extra):
+        values = {
+          "ENGINE_TORQUE_REQUEST": 0,
+          "ACC_DECEL": self.INACTIVE_DECEL,
+          **extra,
+        }
+        self.assertFalse(self._tx(self.packer.make_can_msg_safety("DAS_3", self.LONG_BUS, values)))
+
+
+class TestChryslerLongitudinalSafety(ChryslerLongitudinalSafetyBase, TestChryslerSafety):
+  TX_MSGS = [[0x23B, 0], [0x292, 0], [0x2A6, 0], [0x2D9, 0], [0x1F4, 0], [0x1F5, 0], [0x271, 0]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0x292, 0x2A6, 0x2D9, 0x1F4, 0x1F5, 0x271)}
+  FWD_BLACKLISTED_ADDRS = {2: [0x292, 0x2A6, 0x2D9, 0x1F4, 0x1F5, 0x271]}
+  SAFETY_PARAM = ChryslerSafetyFlags.LONG
+
+
+class TestChryslerRamDTLongitudinalSafety(ChryslerLongitudinalSafetyBase, TestChryslerRamDTSafety):
+  TX_MSGS = [[0xB1, 2], [0xA6, 0], [0xFA, 0], [0x99, 0], [0xE8, 0], [0xA3, 0]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0xA6, 0xFA, 0x99, 0xE8, 0xA3)}
+  FWD_BLACKLISTED_ADDRS = {2: [0xA6, 0xFA, 0x99, 0xE8, 0xA3]}
+  SAFETY_PARAM = ChryslerSafetyFlags.RAM_DT | ChryslerSafetyFlags.LONG
+
+
+class TestChryslerRamHDLongitudinalSafety(ChryslerLongitudinalSafetyBase, TestChryslerRamHDSafety):
+  TX_MSGS = [[0x275, 0], [0x276, 0], [0x23A, 2], [0x1F4, 0], [0x1F5, 0], [0x271, 0]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0x276, 0x275, 0x1F4, 0x1F5, 0x271)}
+  FWD_BLACKLISTED_ADDRS = {2: [0x275, 0x276, 0x1F4, 0x1F5, 0x271]}
+  SAFETY_PARAM = ChryslerSafetyFlags.RAM_HD | ChryslerSafetyFlags.LONG
+
+
+class TestChryslerRamHDAltButtonLongitudinalSafety(TestChryslerRamHDLongitudinalSafety):
+  TX_MSGS = [[0x275, 0], [0x276, 0], [0x23B, 2], [0x1F4, 0], [0x1F5, 0], [0x271, 0]]
+  BUTTON_MSG = "CRUISE_BUTTONS_ALT"
+
+  def setUp(self):
+    libsafety_py.libsafety.set_current_safety_param_sp(ChryslerSafetyFlagsSP.RAM_HD_ALT_BUTTONS)
+    super().setUp()
+
+  def _button_msg(self, cancel=False, resume=False, accel=False, decel=False):
+    values = {"ACC_Cancel": cancel, "ACC_Resume": resume, "ACC_Accel": accel, "ACC_Decel": decel}
+    return self.packer.make_can_msg_safety("CRUISE_BUTTONS_ALT", self.DAS_BUS, values)
+
+
 if __name__ == "__main__":
   unittest.main()
