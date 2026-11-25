@@ -78,17 +78,24 @@ static uint32_t chrysler_cruise_button_addr = 0U;
 #define CHRYSLER_BTN_ENABLE  (CHRYSLER_BTN_ACCEL | CHRYSLER_BTN_DECEL | CHRYSLER_BTN_RESUME)
 
 // DAS_3 ENGINE_TORQUE_REQUEST: 13-bit Motorola at bit 4, 0.25 Nm, offset -500.
-// 2000 = 0 Nm (inactive). 4000 = 500 Nm. Negative torque is not allowed.
+// 2000 = 0 Nm, the value we send when not commanding.
+// 1600 = -100 Nm. Stock coast on a 2020 HD reached -91 Nm; -100 is the floor.
+// 4000 = 500 Nm. The observed controlled pull stayed under 422 Nm. 532.5 Nm was
+// one sample at a driver-brake cancel, not a pull, and stays outside this cap.
 #define CHRYSLER_TORQUE_INACTIVE  2000
+#define CHRYSLER_TORQUE_MIN       1600
 #define CHRYSLER_TORQUE_MAX       4000
 // DAS_3 ACC_DECEL: 12-bit Motorola at bit 19, 0.004885 m/s^2, offset -16.
-// Packer outputs: -3.5 -> 2559, 0.0 -> 3275, +4.0 (no-brake sentinel) -> 4094.
+// Packer: -3.5 -> 2559, 0.0 -> 3275.
+// Stock "no brake" is raw 4093 = 3.9943 m/s^2, not the 4.0 that packs to 4094.
 #define CHRYSLER_DECEL_MIN        2559
 #define CHRYSLER_DECEL_MAX        3275
-#define CHRYSLER_DECEL_INACTIVE   4094
-// DAS_5 WHEEL_TORQUE_REQUEST inactive raw for 0 Nm (offset -7767). Not an actuation path.
-#define CHRYSLER_WHEEL_TORQUE_INACTIVE_HI  0x1EU
-#define CHRYSLER_WHEEL_TORQUE_INACTIVE_LO  0x57U
+#define CHRYSLER_DECEL_INACTIVE   4093
+// DAS_5 on this 2020 HD: wheel torque inactive is raw 0 (bytes 4-5 = 00 00),
+// which decodes to -7767 Nm. FCW idle is FCW_STATE=1, FCW_DISTANCE=3 (byte 0 = 0x1C).
+// Counter stays 0 and the last byte stays 0xFF. There is no Chrysler CRC on DAS_5.
+#define CHRYSLER_DAS5_FCW_IDLE    0x1CU
+#define CHRYSLER_DAS5_CHECK_BYTE  0xFFU
 
 static uint8_t chrysler_get_counter(const CANPacket_t *msg) {
   // High nibble of the byte before the checksum. 8-byte msgs: byte 6. 3-byte cruise buttons: byte 1.
@@ -213,15 +220,16 @@ static bool chrysler_tx_hook(const CANPacket_t *msg) {
     }
   }
 
-  // Longitudinal actuation. DAS_3 is engine torque (accel) and ACC_DECEL (brake, m/s^2).
-  // Limits match the openpilot standard of +2.0 / -3.5 m/s^2 on the brake signal and
-  // cap engine torque at 500 Nm, which is well under a 6.7 Cummins peak (~1000+ Nm)
-  // and under the signal maximum (1547.5 Nm). 0 Nm is the only inactive torque.
-  // The +4.0 m/s^2 ACC_DECEL value is the stock "no brake request" sentinel, not an accel command.
+  // Longitudinal actuation. DAS_3 carries engine torque and the friction-brake decel.
+  // Tuned against a 2020 Ram 2500 Cummins stock-ACC log (route 00000a3e--51571a2b07).
+  // Torque may be slightly negative: stock coasts that way, down to -91 Nm, with ACC_DECEL
+  // left at the +4 sentinel. Friction braking is a separate, shallow ACC_DECEL and is not
+  // combined with a torque command. 500 Nm remains the ceiling. The 532.5 Nm sample in that
+  // log was a single frame at a driver-brake cancel, not the controlled pull (max 422 Nm).
   if (msg->addr == CHRYSLER_ADDR(DAS_3)) {
     const LongitudinalLimits CHRYSLER_LONG_LIMITS = {
       .max_gas = CHRYSLER_TORQUE_MAX,
-      .min_gas = CHRYSLER_TORQUE_INACTIVE,
+      .min_gas = CHRYSLER_TORQUE_MIN,
       .inactive_gas = CHRYSLER_TORQUE_INACTIVE,
       .max_accel = CHRYSLER_DECEL_MAX,
       .min_accel = CHRYSLER_DECEL_MIN,
@@ -231,6 +239,7 @@ static bool chrysler_tx_hook(const CANPacket_t *msg) {
     const int torque = ((msg->data[0] & 0x1FU) << 8) | msg->data[1];
     const int decel = ((msg->data[2] & 0x0FU) << 8) | msg->data[3];
     const bool torque_req = GET_BIT(msg, 7U);
+    const bool acc_active = GET_BIT(msg, 21U);
     const uint8_t decel_req = (uint8_t)((msg->data[4] >> 4) & 0x7U);
     const bool torque_inactive = torque == CHRYSLER_LONG_LIMITS.inactive_gas;
     const bool decel_inactive = decel == CHRYSLER_LONG_LIMITS.inactive_accel;
@@ -238,52 +247,60 @@ static bool chrysler_tx_hook(const CANPacket_t *msg) {
     bool violation = false;
     violation |= longitudinal_gas_checks(torque, CHRYSLER_LONG_LIMITS);
     violation |= longitudinal_accel_checks(decel, CHRYSLER_LONG_LIMITS);
-    // Never request engine torque and friction braking on the same frame.
+    // Engine torque (including coast / engine-brake) and friction braking stay apart.
     violation |= !torque_inactive && !decel_inactive;
-    // Request bits have to match the values. The ECU may honor either.
-    violation |= torque_req != !torque_inactive;
+    // A friction-brake value is only meaningful while ACC is active.
+    violation |= !decel_inactive && !acc_active;
+    // Stock holds ENGINE_TORQUE_REQUEST_MAX for essentially the whole time ACC is active,
+    // including coast. It is not a "torque is positive" flag.
+    violation |= torque_req != acc_active;
     violation |= (decel_req != 0U) != !decel_inactive;
     violation |= decel_req > 1U;
-    // Unused or unvalidated actuation bits stay clear.
-    violation |= (msg->data[2] & 0xC0U) != 0U;   // bit 22 unused, DISABLE_FUEL_SHUTOFF
+    // Bit 22 is unused on the logged truck. DISABLE_FUEL_SHUTOFF (bit 23) is set for
+    // ~96% of ACC-active time, so it is allowed only while longitudinal control is allowed.
+    violation |= (msg->data[2] & 0x40U) != 0U;
+    if (!get_longitudinal_allowed()) {
+      violation |= (msg->data[2] & 0x80U) != 0U;
+      violation |= acc_active;
+    }
+    // Stop/go bits were never set in the log. Do not command them.
+    violation |= GET_BIT(msg, 5U);               // ACC_STANDSTILL
+    violation |= GET_BIT(msg, 6U);               // ACC_GO
     violation |= (msg->data[4] & 0x0FU) != 0U;   // GR_MAX_REQ
     violation |= (msg->data[4] & 0x80U) != 0U;   // unused
     violation |= msg->data[5] != 0U;             // ACC_FAULTED
     violation |= (msg->data[6] & 0x0FU) != 0U;   // COLLISION_BRK_PREP, ACC_BRK_PREP, unused
-    if (!get_longitudinal_allowed()) {
-      violation |= GET_BIT(msg, 5U);             // ACC_STANDSTILL
-      violation |= GET_BIT(msg, 6U);             // ACC_GO
-      violation |= GET_BIT(msg, 21U);            // ACC_ACTIVE
-    }
 
     if (violation) {
       tx = false;
     }
   }
 
-  // DAS_5 carries WHEEL_TORQUE_REQUEST. That path is not used; only the inactive value is allowed.
-  // Byte 3 is the cluster set speed. Bytes 0-2 are FCW flags and stay clear.
+  // DAS_5 wheel torque is unused. Stock inactive is raw 0 (bytes 4-5 = 00 00), not 0 Nm.
+  // Byte 0 is the logged FCW idle pattern. Byte 3 echoes vehicle speed. No CRC: the
+  // counter nibble is 0 and the last byte is 0xFF. Any other wheel-torque encoding is rejected.
   if (msg->addr == CHRYSLER_ADDR(DAS_5)) {
     bool violation = false;
-    violation |= msg->data[0] != 0U;
+    violation |= msg->data[0] != CHRYSLER_DAS5_FCW_IDLE;
     violation |= msg->data[1] != 0U;
     violation |= msg->data[2] != 0U;
-    violation |= msg->data[4] != CHRYSLER_WHEEL_TORQUE_INACTIVE_HI;
-    violation |= msg->data[5] != CHRYSLER_WHEEL_TORQUE_INACTIVE_LO;
-    violation |= (msg->data[6] & 0x0FU) != 0U;
+    violation |= msg->data[4] != 0U;
+    violation |= msg->data[5] != 0U;
+    violation |= msg->data[6] != 0U;
+    violation |= msg->data[7] != CHRYSLER_DAS5_CHECK_BYTE;
     if (violation) {
       tx = false;
     }
   }
 
-  // DAS_4 is the cluster / FCW display. FCW braking bits are rejected.
-  // Bytes 1-2 are set speed, byte 7 is the digital speed, byte 4 bits 4-6 are ACC_STATE.
+  // DAS_4 is the cluster. Set speed is bytes 1-2. ACC_STATE on this truck is 0, 3, or 4.
+  // FCW_BRAKE_DISABLED is 1 in every logged frame. FCW_BRAKE_ENABLED (byte 3) stays 0.
   if (msg->addr == CHRYSLER_ADDR(DAS_4)) {
     bool violation = false;
     violation |= msg->data[0] != 0U;
     violation |= msg->data[3] != 0U;
-    violation |= (msg->data[4] & 0x8FU) != 0U;
-    violation |= msg->data[5] != 0U;
+    violation |= (msg->data[4] != 0x00U) && (msg->data[4] != 0x30U) && (msg->data[4] != 0x40U);
+    violation |= msg->data[5] != 0x80U;
     violation |= msg->data[6] != 0U;
     if (violation) {
       tx = false;
@@ -355,7 +372,7 @@ static safety_config chrysler_init(uint16_t param) {
     {.msg = {{CHRYSLER_ESP_1, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{514, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_ECM_5, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{CHRYSLER_CRUISE_BUTTONS, 0, 3, 20U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_CRUISE_BUTTONS, 0, 3, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_TRACTION_BUTTON, 0, 8, 1U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},
   };
 
@@ -364,7 +381,7 @@ static safety_config chrysler_init(uint16_t param) {
     {.msg = {{CHRYSLER_RAM_DT_ESP_1, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_DT_ESP_8, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_DT_ECM_5, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{CHRYSLER_RAM_DT_CRUISE_BUTTONS, 0, 3, 20U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_DT_CRUISE_BUTTONS, 0, 3, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_DT_Center_Stack_2, 0, 8, 1U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},
   };
 
@@ -382,7 +399,7 @@ static safety_config chrysler_init(uint16_t param) {
     {.msg = {{CHRYSLER_RAM_HD_ESP_1, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_HD_ESP_8, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_HD_ECM_5, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{CHRYSLER_RAM_HD_CRUISE_BUTTONS, 0, 3, 20U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_CRUISE_BUTTONS, 0, 3, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_HD_Center_Stack_2, 0, 8, 1U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},
   };
 
@@ -391,7 +408,7 @@ static safety_config chrysler_init(uint16_t param) {
     {.msg = {{CHRYSLER_RAM_HD_ESP_1, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_HD_ESP_8, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_HD_ECM_5, 0, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{CHRYSLER_RAM_HD_CRUISE_BUTTONS_ALT, 0, 3, 20U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{CHRYSLER_RAM_HD_CRUISE_BUTTONS_ALT, 0, 3, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{CHRYSLER_RAM_HD_Center_Stack_2, 0, 8, 1U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},
   };
 

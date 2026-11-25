@@ -104,25 +104,34 @@ class CAR(Platforms):
 
 class CarControllerParams:
   # Safety ceilings. Must match opendbc/safety/modes/chrysler.h.
-  # +2.0 / -3.5 m/s^2 is the openpilot standard (also what commaai/panda#1719 encoded
-  # for ACC_DECEL). RamBetaLong used +3.5 / -4.0; those are intentionally not used.
-  ACCEL_MIN = -3.5          # m/s^2, friction brake
-  ACCEL_MAX = 2.0           # m/s^2, planner cap. The torque map below will not reach this on a Cummins.
-  MAX_TORQUE = 500.0        # Nm, safety max on ENGINE_TORQUE_REQUEST
-  INACTIVE_DECEL = 4.0      # m/s^2, ACC_DECEL "no brake request" sentinel
+  # Friction-brake decel still uses the openpilot standard of -3.5 m/s^2. The only
+  # stock friction-brake samples on the 2020 HD were about -0.3 m/s^2 and under a second.
+  ACCEL_MIN = -3.5           # m/s^2
+  ACCEL_MAX = 2.0            # m/s^2. The logged pull peaked near 2.1; keep the usual cap.
+  MAX_TORQUE = 500.0         # Nm, safety max. The 532.5 Nm sample was a cancel blip.
+  MIN_TORQUE = -100.0        # Nm, safety floor. Stock coast reached -91 Nm.
+  # Stock "no brake" is raw 4093, which decodes to 3.9943 m/s^2. 4.0 packs to raw 4094.
+  INACTIVE_DECEL = 3.9943
 
-  # UNTUNED. Carried from realfast RamBetaLong (Vincent Wright, through 2023-08-29,
-  # commit 0defa423) as the point where they started requesting brakes. Not validated
-  # on a 2020-24 Ram 2500/3500 or a 1500.
+  # Friction brake only below this. Stock used engine torque for ordinary slowing and
+  # ACC_DECEL for two short extra dips around -0.3 m/s^2. -0.25 is that neighborhood;
+  # longer braking was not in the log.
   BRAKE_ENTER_ACCEL = -0.25  # m/s^2
 
-  # UNTUNED open-loop map. RamBetaLong clipped a kinetic-energy estimate to ±6 Nm and
-  # added measured engine torque. That ±6 Nm delta is NOT used here: if engine torque
-  # tracks the request, adding it back integrates up to the cap. 80 Nm per m/s^2,
-  # hard-capped at 200 Nm, under-actuates a 6.7 Cummins (peak roughly 1000+ Nm) on
-  # purpose until ENGINE_TORQUE is logged against vehicle accel. Safety still allows 500 Nm.
-  TORQUE_FROM_ACCEL = 80.0   # Nm / (m/s^2)
-  MAX_TORQUE_CMD = 200.0     # Nm, controller cap, below MAX_TORQUE
+  # Open-loop map from route 00000a3e--51571a2b07 (2020 Ram 2500 Cummins, stock ACC,
+  # no driver gas, no ACC_DECEL_REQ, n=4320, r=0.56):
+  #   ENGINE_TORQUE_REQUEST ≈ 122 Nm per m/s^2 * accel + 145 Nm
+  # 55 mph hold was ~152 Nm. The 5→55 mph pull asked for 392–422 Nm.
+  # No speed term: almost all of the steady data is near 55 mph, so speed and the
+  # 145 Nm rolling load are not separable. The -91 Nm engine-brake dips sit below
+  # this line; the safety floor allows them, this mean fit does not reproduce them.
+  TORQUE_FROM_ACCEL = 122.0  # Nm / (m/s^2)
+  TORQUE_OFFSET = 145.0      # Nm at 0 m/s^2
+  MIN_TORQUE_CMD = -100.0    # Nm, same as the safety floor
+  MAX_TORQUE_CMD = 450.0     # Nm, above the 422 Nm pull and under the 500 Nm ceiling
+  # DAS_5 wheel-torque raw 0. The packer turns a physical 0 Nm into 0x1E57, which
+  # this truck never sends. -7767 Nm is raw 0, bytes 4-5 = 00 00.
+  WHEEL_TORQUE_INACTIVE = -7767.0
 
   def __init__(self, CP):
     self.STEER_STEP = 2  # 50 Hz

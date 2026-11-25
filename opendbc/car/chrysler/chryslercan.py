@@ -1,7 +1,7 @@
 from opendbc.car import structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.crc import CRC8J1850
-from opendbc.car.chrysler.values import CUSW_CARS, RAM_CARS
+from opendbc.car.chrysler.values import CUSW_CARS, RAM_CARS, CarControllerParams
 
 
 def _display_speed(set_speed, conversion):
@@ -71,41 +71,53 @@ def create_lkas_command(packer, CP, apply_torque, lkas_control_bit):
   return packer.make_can_msg("LKAS_COMMAND", 0, values)
 
 
-def create_das_3(packer, accel_active, torque, decel, torque_active, decel_active, standstill, go):
-  # ENGINE_TORQUE_REQUEST is absolute Nm. ACC_DECEL is m/s^2; +4 is the no-brake sentinel.
-  # GR_MAX_REQ, brake-prep and fuel-shutoff bits are left at 0. Safety rejects anything else.
+def create_das_3(packer, acc_active, torque, decel, braking):
+  # ENGINE_TORQUE_REQUEST is absolute Nm and may be negative while coasting.
+  # ACC_DECEL uses 3.9943 m/s^2 (raw 4093) as the no-brake value seen on the 2020 HD.
+  # ENGINE_TORQUE_REQUEST_MAX and DISABLE_FUEL_SHUTOFF track ACC_ACTIVE, which is how
+  # stock spends essentially all of an ACC-active stint. Stop/go bits stay 0.
   values = {
-    "ACC_ACTIVE": 1 if accel_active else 0,
+    "ACC_ACTIVE": 1 if acc_active else 0,
     "ENGINE_TORQUE_REQUEST": torque,
-    "ENGINE_TORQUE_REQUEST_MAX": 1 if torque_active else 0,
+    "ENGINE_TORQUE_REQUEST_MAX": 1 if acc_active else 0,
     "ACC_DECEL": decel,
-    "ACC_DECEL_REQ": 1 if decel_active else 0,
-    "ACC_STANDSTILL": 1 if standstill else 0,
-    "ACC_GO": 1 if go else 0,
+    "ACC_DECEL_REQ": 1 if braking else 0,
+    "DISABLE_FUEL_SHUTOFF": 1 if acc_active else 0,
   }
   return packer.make_can_msg("DAS_3", 0, values)
 
 
 def create_das_4(packer, acc_state, set_speed):
-  # Cluster display only. FCW brake-enable is left clear; safety rejects it.
-  # acc_state 0/1/2 is the RamBetaLong mapping (off / available / set). Untuned on HD.
+  # Cluster set speed lives here. On the 2020 HD, ACC_STATE is 0 off, 3 available, 4 engaged.
+  # FCW_BRAKE_DISABLED is 1 in every logged frame. FCW_BRAKE_ENABLED stays 0.
   values = {
     "ACC_STATE": acc_state,
     "ACC_SET_SPEED_KPH": _display_speed(set_speed, CV.MS_TO_KPH),
     "ACC_SET_SPEED_MPH": _display_speed(set_speed, CV.MS_TO_MPH),
     "FCW_BRAKE_ENABLED": 0,
+    "FCW_BRAKE_DISABLED": 1,
   }
   return packer.make_can_msg("DAS_4", 0, values)
 
 
-def create_das_5(packer, set_speed):
-  # Wheel torque is not commanded. Safety only allows the 0 Nm inactive value.
+def create_das_5(packer, vehicle_speed):
+  # Wheel torque is not an actuation path. Stock sends raw 0 (bytes 4-5 = 00 00).
+  # SET_SPEED_KPH follows vehicle speed on this truck; the cruise set point is DAS_4.
+  # FCW_STATE is 1 and FCW_DISTANCE is 3 in every logged frame. There is no Chrysler
+  # CRC: the counter stays 0 and the last byte stays 0xFF.
   values = {
-    "WHEEL_TORQUE_REQUEST": 0,
+    "WHEEL_TORQUE_REQUEST": CarControllerParams.WHEEL_TORQUE_INACTIVE,
     "WHEEL_TORQUE_REQUEST_ACTIVE": 0,
-    "SET_SPEED_KPH": _display_speed(set_speed, CV.MS_TO_KPH),
+    "FCW_STATE": 1,
+    "FCW_DISTANCE": 3,
+    "SET_SPEED_KPH": _display_speed(vehicle_speed, CV.MS_TO_KPH),
+    "COUNTER": 0,
   }
-  return packer.make_can_msg("DAS_5", 0, values)
+  addr, dat, bus = packer.make_can_msg("DAS_5", 0, values)
+  dat = bytearray(dat)
+  dat[6] = 0
+  dat[7] = 0xFF
+  return addr, bytes(dat), bus
 
 
 def create_cruise_buttons(packer, cruise_msg, frame, bus, cancel=False, resume=False, accel=False, decel=False):

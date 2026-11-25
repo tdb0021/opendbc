@@ -167,7 +167,8 @@ class ChryslerLongitudinalSafetyBase:
   set so lateral can continue, but longitudinal commands must be the inactive values.
   """
 
-  MIN_ENGINE_TORQUE = 0.0
+  # -100 Nm matches the safety floor. Stock coast on the 2020 HD reached -91 Nm.
+  MIN_ENGINE_TORQUE = -100.0
   MAX_ENGINE_TORQUE = 500.0
   INACTIVE_ENGINE_TORQUE = 0.0
   MIN_POSSIBLE_ENGINE_TORQUE = -500.0
@@ -175,9 +176,9 @@ class ChryslerLongitudinalSafetyBase:
 
   MIN_DECEL = -3.5
   MAX_DECEL = 0.0
-  INACTIVE_DECEL = 4.0
+  # Raw 4093. 4.0 packs to 4094, which this truck does not send.
+  INACTIVE_DECEL = 3.9943
   MIN_POSSIBLE_DECEL = -16.0
-  # Just above the +4.0 sentinel so the inactive value is inside the sampled range.
   MAX_POSSIBLE_DECEL = 4.01
 
   BUTTON_MSG = "CRUISE_BUTTONS"
@@ -197,11 +198,14 @@ class ChryslerLongitudinalSafetyBase:
     return self.packer.make_can_msg_safety(self.BUTTON_MSG, 0, values)
 
   def _torque_msg(self, torque):
+    commanding = torque != self.INACTIVE_ENGINE_TORQUE
     values = {
       "ENGINE_TORQUE_REQUEST": torque,
-      "ENGINE_TORQUE_REQUEST_MAX": 0 if torque == self.INACTIVE_ENGINE_TORQUE else 1,
+      "ENGINE_TORQUE_REQUEST_MAX": 1 if commanding else 0,
+      "ACC_ACTIVE": 1 if commanding else 0,
       "ACC_DECEL": self.INACTIVE_DECEL,
       "ACC_DECEL_REQ": 0,
+      "DISABLE_FUEL_SHUTOFF": 1 if commanding else 0,
     }
     return self.packer.make_can_msg_safety("DAS_3", self.LONG_BUS, values)
 
@@ -209,23 +213,34 @@ class ChryslerLongitudinalSafetyBase:
     braking = decel != self.INACTIVE_DECEL
     values = {
       "ENGINE_TORQUE_REQUEST": self.INACTIVE_ENGINE_TORQUE,
-      "ENGINE_TORQUE_REQUEST_MAX": 0,
+      "ENGINE_TORQUE_REQUEST_MAX": 1 if braking else 0,
+      "ACC_ACTIVE": 1 if braking else 0,
       "ACC_DECEL": decel,
       "ACC_DECEL_REQ": 1 if braking else 0,
+      "DISABLE_FUEL_SHUTOFF": 1 if braking else 0,
     }
     return self.packer.make_can_msg_safety("DAS_3", self.LONG_BUS, values)
 
-  def _das5_msg(self, wheel_torque=0, wheel_active=0, set_speed=0):
+  def _das5_msg(self, wheel_torque=-7767, wheel_active=0, set_speed=0, fcw_state=1, fcw_distance=3, stock_tail=True):
     values = {
       "WHEEL_TORQUE_REQUEST": wheel_torque,
       "WHEEL_TORQUE_REQUEST_ACTIVE": wheel_active,
+      "FCW_STATE": fcw_state,
+      "FCW_DISTANCE": fcw_distance,
       "SET_SPEED_KPH": set_speed,
+      "COUNTER": 0,
     }
-    return self.packer.make_can_msg_safety("DAS_5", self.LONG_BUS, values)
+    addr, dat, _ = self.packer.make_can_msg("DAS_5", self.LONG_BUS, values)
+    dat = bytearray(dat)
+    if stock_tail:
+      dat[6] = 0
+      dat[7] = 0xFF
+    return libsafety_py.make_CANPacket(addr, self.LONG_BUS, bytes(dat))
 
-  def _das4_msg(self, fcw_brake=0, acc_state=0, set_speed_kph=0):
+  def _das4_msg(self, fcw_brake=0, acc_state=4, set_speed_kph=0, fcw_disabled=1):
     values = {
       "FCW_BRAKE_ENABLED": fcw_brake,
+      "FCW_BRAKE_DISABLED": fcw_disabled,
       "ACC_STATE": acc_state,
       "ACC_SET_SPEED_KPH": set_speed_kph,
     }
@@ -244,10 +259,41 @@ class ChryslerLongitudinalSafetyBase:
   def test_no_torque_and_brake_together(self):
     self.safety.set_controls_allowed(True)
     values = {
+      "ACC_ACTIVE": 1,
       "ENGINE_TORQUE_REQUEST": 100,
       "ENGINE_TORQUE_REQUEST_MAX": 1,
       "ACC_DECEL": -1.0,
       "ACC_DECEL_REQ": 1,
+      "DISABLE_FUEL_SHUTOFF": 1,
+    }
+    self.assertFalse(self._tx(self.packer.make_can_msg_safety("DAS_3", self.LONG_BUS, values)))
+
+  def test_stock_decel_sentinel(self):
+    # Stock no-brake value is 3.9943 m/s^2 (raw 4093). 4.0 packs to a different raw.
+    for allowed in (True, False):
+      self.safety.set_controls_allowed(allowed)
+      self.assertTrue(self._tx(self._decel_msg(3.9943)))
+      self.assertFalse(self._tx(self._decel_msg(4.0)))
+
+  def test_stock_coast_torque_allowed(self):
+    # -91 Nm was the deepest stock coast. -100 is the floor. 532.5 was a cancel blip.
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._torque_msg(-91)))
+    self.assertTrue(self._tx(self._torque_msg(-100)))
+    self.assertFalse(self._tx(self._torque_msg(-101)))
+    self.assertFalse(self._tx(self._torque_msg(532.5)))
+    self.assertTrue(self._tx(self._torque_msg(422)))
+    self.safety.set_controls_allowed(False)
+    self.assertFalse(self._tx(self._torque_msg(-91)))
+
+  def test_fuel_shutoff_bit_only_while_allowed(self):
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._torque_msg(152)))
+    self.safety.set_controls_allowed(False)
+    values = {
+      "ENGINE_TORQUE_REQUEST": 0,
+      "ACC_DECEL": self.INACTIVE_DECEL,
+      "DISABLE_FUEL_SHUTOFF": 1,
     }
     self.assertFalse(self._tx(self.packer.make_can_msg_safety("DAS_3", self.LONG_BUS, values)))
 
@@ -293,18 +339,26 @@ class ChryslerLongitudinalSafetyBase:
 
   def test_wheel_torque_inactive_only(self):
     self.safety.set_controls_allowed(True)
-    self.assertTrue(self._tx(self._das5_msg(0, 0, set_speed=80)))
+    # Stock inactive is raw 0 (-7767 Nm), not the 0 Nm encoding.
+    self.assertTrue(self._tx(self._das5_msg(-7767, 0, set_speed=88)))
+    self.assertFalse(self._tx(self._das5_msg(0, 0)))
     self.assertFalse(self._tx(self._das5_msg(100, 1)))
-    self.assertFalse(self._tx(self._das5_msg(0, 1)))
+    self.assertFalse(self._tx(self._das5_msg(-7767, 1)))
+    self.assertFalse(self._tx(self._das5_msg(-7767, 0, stock_tail=False)))
+    self.assertFalse(self._tx(self._das5_msg(-7767, 0, fcw_state=0)))
 
   def test_fcw_brake_rejected(self):
     self.safety.set_controls_allowed(True)
-    self.assertTrue(self._tx(self._das4_msg(0, acc_state=2, set_speed_kph=80)))
-    self.assertFalse(self._tx(self._das4_msg(1, acc_state=2, set_speed_kph=80)))
+    for state in (0, 3, 4):
+      self.assertTrue(self._tx(self._das4_msg(0, acc_state=state, set_speed_kph=89)))
+    self.assertFalse(self._tx(self._das4_msg(0, acc_state=2, set_speed_kph=89)))
+    self.assertFalse(self._tx(self._das4_msg(1, acc_state=4, set_speed_kph=89)))
+    self.assertFalse(self._tx(self._das4_msg(0, acc_state=4, fcw_disabled=0)))
 
   def test_unvalidated_das3_bits_rejected(self):
     self.safety.set_controls_allowed(True)
-    for extra in ({"ACC_BRK_PREP": 1}, {"COLLISION_BRK_PREP": 1}, {"GR_MAX_REQ": 1}, {"DISABLE_FUEL_SHUTOFF": 1}):
+    for extra in ({"ACC_BRK_PREP": 1}, {"COLLISION_BRK_PREP": 1}, {"GR_MAX_REQ": 1},
+                  {"ACC_STANDSTILL": 1}, {"ACC_GO": 1}):
       with self.subTest(extra=extra):
         values = {
           "ENGINE_TORQUE_REQUEST": 0,

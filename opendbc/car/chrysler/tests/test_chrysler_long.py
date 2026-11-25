@@ -71,29 +71,31 @@ class TestChryslerLongitudinal(unittest.TestCase):
     CC.actuators.accel = 1.0
     CC.actuators.longControlState = LongCtrlState.pid
     sig = self._das3(CI, CC)
-    self.assertEqual(sig["ENGINE_TORQUE_REQUEST"], CarControllerParams.TORQUE_FROM_ACCEL)
+    self.assertEqual(sig["ENGINE_TORQUE_REQUEST"], 122.0 + 145.0)
     self.assertEqual(sig["ENGINE_TORQUE_REQUEST_MAX"], 1)
-    self.assertAlmostEqual(sig["ACC_DECEL"], CarControllerParams.INACTIVE_DECEL, places=2)
+    self.assertEqual(sig["DISABLE_FUEL_SHUTOFF"], 1)
+    self.assertAlmostEqual(sig["ACC_DECEL"], CarControllerParams.INACTIVE_DECEL, places=3)
     self.assertEqual(sig["ACC_DECEL_REQ"], 0)
     self.assertLessEqual(sig["ENGINE_TORQUE_REQUEST"], CarControllerParams.MAX_TORQUE_CMD)
 
     CC.actuators.accel = 5.0
     sig = self._das3(CI, CC)
-    self.assertEqual(sig["ENGINE_TORQUE_REQUEST"], CarControllerParams.ACCEL_MAX * CarControllerParams.TORQUE_FROM_ACCEL)
+    self.assertEqual(sig["ENGINE_TORQUE_REQUEST"], 122.0 * CarControllerParams.ACCEL_MAX + 145.0)
     self.assertLess(sig["ENGINE_TORQUE_REQUEST"], CarControllerParams.MAX_TORQUE)
 
     CC.actuators.accel = -2.0
     sig = self._das3(CI, CC)
     self.assertEqual(sig["ENGINE_TORQUE_REQUEST"], 0)
-    self.assertEqual(sig["ENGINE_TORQUE_REQUEST_MAX"], 0)
+    self.assertEqual(sig["ENGINE_TORQUE_REQUEST_MAX"], 1)
     self.assertAlmostEqual(sig["ACC_DECEL"], -2.0, places=2)
     self.assertEqual(sig["ACC_DECEL_REQ"], 1)
 
-    # Between 0 and the brake threshold the command coasts. Untuned threshold from RamBetaLong.
+    # Above the friction-brake threshold the command stays on the torque line.
     CC.actuators.accel = -0.1
     sig = self._das3(CI, CC)
-    self.assertEqual(sig["ENGINE_TORQUE_REQUEST"], 0)
-    self.assertAlmostEqual(sig["ACC_DECEL"], CarControllerParams.INACTIVE_DECEL, places=2)
+    self.assertAlmostEqual(sig["ENGINE_TORQUE_REQUEST"], 122.0 * -0.1 + 145.0, delta=0.25)
+    self.assertEqual(sig["ACC_DECEL_REQ"], 0)
+    self.assertAlmostEqual(sig["ACC_DECEL"], CarControllerParams.INACTIVE_DECEL, places=3)
 
   def test_pedal_forces_inactive_frame(self):
     CP, CP_SP = _params(CAR.RAM_HD_5TH_GEN, alpha_long=True)
@@ -108,7 +110,27 @@ class TestChryslerLongitudinal(unittest.TestCase):
     sig = self._das3(CI, CC)
     self.assertEqual(sig["ACC_ACTIVE"], 0)
     self.assertEqual(sig["ENGINE_TORQUE_REQUEST"], 0)
-    self.assertAlmostEqual(sig["ACC_DECEL"], CarControllerParams.INACTIVE_DECEL, places=2)
+    self.assertEqual(sig["ENGINE_TORQUE_REQUEST_MAX"], 0)
+    self.assertEqual(sig["DISABLE_FUEL_SHUTOFF"], 0)
+    self.assertAlmostEqual(sig["ACC_DECEL"], CarControllerParams.INACTIVE_DECEL, places=3)
+
+  def test_das5_matches_stock_idle(self):
+    CP, CP_SP = _params(CAR.RAM_HD_5TH_GEN, alpha_long=True)
+    CI = CarInterface(CP, CP_SP)
+    CI.update([])
+    CI.CS.out.vEgo = 24.6  # ~55 mph
+    CC = structs.CarControl()
+    CC.enabled = True
+    CC.longActive = True
+    CC.actuators.accel = 0.0
+    _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), 0)
+    das5 = [msg for msg in sends if msg[0] == 0x271]
+    self.assertEqual(len(das5), 1)
+    dat = das5[0][1]
+    self.assertEqual(dat[0], 0x1C)   # FCW_STATE=1, FCW_DISTANCE=3
+    self.assertEqual(dat[4:6], b"\x00\x00")  # wheel torque raw 0, not 0 Nm
+    self.assertEqual(dat[6], 0)
+    self.assertEqual(dat[7], 0xFF)
 
   def test_stock_long_does_not_send_das3(self):
     CP, CP_SP = _params(CAR.RAM_HD_5TH_GEN, alpha_long=False)

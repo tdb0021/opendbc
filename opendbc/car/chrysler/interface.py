@@ -95,9 +95,9 @@ class CarInterface(CarInterfaceBase):
         ret.openpilotLongitudinalControl = True
         ret.pcmCruise = False
         ret.safetyConfigs[0].safetyParam |= ChryslerSafetyFlags.LONG.value
-        # UNTUNED. Not a fit from RamBetaLong (that branch had no longitudinal PID).
-        # 0.5 s is a diesel-lag guess so the planner does not wind up against turbo delay.
-        # ki stays at the default of 0 until a truck is logged.
+        # 0.5 s is still a guess for Cummins turbo lag. The torque map itself is the
+        # 122 Nm per m/s^2 + 145 Nm fit from the 2020 HD stock-ACC log. ki stays 0;
+        # that log is one speed and is not a longitudinal-PID fit.
         ret.longitudinalActuatorDelay = 0.5
 
     return ret
