@@ -106,29 +106,38 @@ class CarControllerParams:
   # Safety ceilings. Must match opendbc/safety/modes/chrysler.h.
   # Friction-brake decel still uses the openpilot standard of -3.5 m/s^2. The only
   # stock friction-brake samples on the 2020 HD were about -0.3 m/s^2 and under a second.
-  ACCEL_MIN = -3.5           # m/s^2
-  ACCEL_MAX = 2.0            # m/s^2. The logged pull peaked near 2.1; keep the usual cap.
-  MAX_TORQUE = 500.0         # Nm, safety max. The 532.5 Nm sample was a cancel blip.
-  MIN_TORQUE = -100.0        # Nm, safety floor. Stock coast reached -91 Nm.
+  ACCEL_MIN = -3.5           # m/s^2. Stock friction brake reached -2.75; -3.5 is the usual cap.
+  ACCEL_MAX = 2.0            # m/s^2 planner cap. Stock's 937 Nm kick was at ~1.2 m/s^2.
+  MAX_TORQUE = 500.0         # Nm safety ceiling. 937 Nm stock kicks are not authorized.
+  MIN_TORQUE = -120.0        # Nm. Deepest stock request was -98 Nm.
   # Stock "no brake" is raw 4093, which decodes to 3.9943 m/s^2. 4.0 packs to raw 4094.
   INACTIVE_DECEL = 3.9943
 
-  # Friction brake only below this. Stock used engine torque for ordinary slowing and
-  # ACC_DECEL for two short extra dips around -0.3 m/s^2. -0.25 is that neighborhood;
-  # longer braking was not in the log.
+  # Friction brake below this. Clip 2 held a friction brake for 4.4 s down to -2.75.
   BRAKE_ENTER_ACCEL = -0.25  # m/s^2
+  # Below this decel, also send the GR_MAX_REQ=4 stock used at the bottom of the hard stop.
+  HARD_BRAKE_DECEL = -2.0
+  # Stock ACC was never engaged below 3.6 kph, and standstill/go were never set.
+  # Below this speed the controller drops ACC instead of creeping or holding.
+  LOW_SPEED_HANDBACK = 1.0  # m/s
 
-  # Open-loop map from route 00000a3e--51571a2b07 (2020 Ram 2500 Cummins, stock ACC,
-  # no driver gas, no ACC_DECEL_REQ, n=4320, r=0.56):
-  #   ENGINE_TORQUE_REQUEST ≈ 122 Nm per m/s^2 * accel + 145 Nm
-  # 55 mph hold was ~152 Nm. The 5→55 mph pull asked for 392–422 Nm.
-  # No speed term: almost all of the steady data is near 55 mph, so speed and the
-  # 145 Nm rolling load are not separable. The -91 Nm engine-brake dips sit below
-  # this line; the safety floor allows them, this mean fit does not reproduce them.
-  TORQUE_FROM_ACCEL = 122.0  # Nm / (m/s^2)
-  TORQUE_OFFSET = 145.0      # Nm at 0 m/s^2
-  MIN_TORQUE_CMD = -100.0    # Nm, same as the safety floor
-  MAX_TORQUE_CMD = 450.0     # Nm, above the 422 Nm pull and under the 500 Nm ceiling
+  # Sample-weighted blend of the two stock-ACC fits (no driver gas, no friction brake):
+  #   clip 1 n=4320: 122 Nm per m/s^2 + 145 Nm
+  #   clip 2 n=10216: 244 Nm per m/s^2 + 128 Nm (slope pulled by the 937 Nm kick)
+  #   blend: 208 Nm per m/s^2 + 133 Nm
+  # A speed term fit on clip 2 raised R^2 but asked for more torque at low speed, which
+  # is the wrong direction for a launch, and the hold medians are not monotonic in speed
+  # (83 Nm at 60-80 kph, 128 at 80-100, ~150 at 55). No speed term.
+  # At 2.0 m/s^2 the line is 549 Nm and the command cap clips it to 480, under the
+  # 500 Nm safety ceiling. The 937 Nm kick is not reproduced.
+  TORQUE_FROM_ACCEL = 208.0  # Nm / (m/s^2)
+  TORQUE_OFFSET = 133.0      # Nm at 0 m/s^2
+  MIN_TORQUE_CMD = -120.0
+  MAX_TORQUE_CMD = 480.0
+  # Gas override parks the request here. Stock median was about -90 Nm, MAX bit off.
+  GAS_OVERRIDE_TORQUE = -90.0
+  # Sent with ACC_DECEL. The hard stop held about -75 to -88 Nm.
+  BRAKE_TORQUE = -80.0
   # DAS_5 wheel-torque raw 0. The packer turns a physical 0 Nm into 0x1E57, which
   # this truck never sends. -7767 Nm is raw 0, bytes 4-5 = 00 00.
   WHEEL_TORQUE_INACTIVE = -7767.0

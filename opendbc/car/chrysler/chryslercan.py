@@ -71,18 +71,23 @@ def create_lkas_command(packer, CP, apply_torque, lkas_control_bit):
   return packer.make_can_msg("LKAS_COMMAND", 0, values)
 
 
-def create_das_3(packer, acc_active, torque, decel, braking):
-  # ENGINE_TORQUE_REQUEST is absolute Nm and may be negative while coasting.
-  # ACC_DECEL uses 3.9943 m/s^2 (raw 4093) as the no-brake value seen on the 2020 HD.
-  # ENGINE_TORQUE_REQUEST_MAX and DISABLE_FUEL_SHUTOFF track ACC_ACTIVE, which is how
-  # stock spends essentially all of an ACC-active stint. Stop/go bits stay 0.
+def create_das_3(packer, acc_active, torque, decel, braking, torque_max=None, fuel_shutoff=None, gr_max_req=0):
+  # ENGINE_TORQUE_REQUEST is absolute Nm. It is negative while coasting and while braking.
+  # ACC_DECEL uses 3.9943 m/s^2 (raw 4093) as the no-brake value.
+  # torque_max and fuel_shutoff follow ACC_ACTIVE while we are commanding, and both drop
+  # on a gas override (ACC stays active, the request sits near -90 Nm). Stop/go stays 0.
+  if torque_max is None:
+    torque_max = bool(acc_active)
+  if fuel_shutoff is None:
+    fuel_shutoff = bool(acc_active)
   values = {
     "ACC_ACTIVE": 1 if acc_active else 0,
     "ENGINE_TORQUE_REQUEST": torque,
-    "ENGINE_TORQUE_REQUEST_MAX": 1 if acc_active else 0,
+    "ENGINE_TORQUE_REQUEST_MAX": 1 if torque_max else 0,
     "ACC_DECEL": decel,
     "ACC_DECEL_REQ": 1 if braking else 0,
-    "DISABLE_FUEL_SHUTOFF": 1 if acc_active else 0,
+    "DISABLE_FUEL_SHUTOFF": 1 if fuel_shutoff else 0,
+    "GR_MAX_REQ": gr_max_req,
   }
   return packer.make_can_msg("DAS_3", 0, values)
 

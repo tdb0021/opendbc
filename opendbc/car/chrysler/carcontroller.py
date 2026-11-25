@@ -110,37 +110,56 @@ class CarController(CarControllerBase, MadsCarController, CarControllerExt, Inte
     return new_actuators, can_sends
 
   def _long_control_messages(self, CC, CS):
-    # Pedal down, or not long-active: send the neutral frame so the last torque request
-    # cannot latch. Safety rejects a non-neutral frame in that state.
-    pedals = CS.out.gasPressed or CS.out.brakePressed
-    if not CC.longActive or pedals:
+    p = CarControllerParams
+    gas_override = CS.out.gasPressed and CC.enabled and not CS.out.brakePressed
+    # No stock ACC stop was observed. Below ~3.6 kph, drop the command instead of
+    # creeping or holding with the untested standstill bits.
+    handback = CS.out.vEgo < p.LOW_SPEED_HANDBACK
+    if gas_override:
+      # ACC stays engaged. The request parks near -90 Nm and the max / fuel-shutoff
+      # bits drop, so the ECM follows the pedal instead of our torque number.
+      self.accel = 0.0
+      active = True
+      braking = False
+      torque = p.GAS_OVERRIDE_TORQUE
+      decel = p.INACTIVE_DECEL
+      torque_max = False
+      fuel_shutoff = False
+      gr_max = 0
+    elif (not CC.longActive) or CS.out.brakePressed or handback:
       self.accel = 0.0
       active = False
       braking = False
       torque = 0.0
-      decel = CarControllerParams.INACTIVE_DECEL
+      decel = p.INACTIVE_DECEL
+      torque_max = False
+      fuel_shutoff = False
+      gr_max = 0
     else:
-      accel = min(max(float(CC.actuators.accel), CarControllerParams.ACCEL_MIN), CarControllerParams.ACCEL_MAX)
+      accel = min(max(float(CC.actuators.accel), p.ACCEL_MIN), p.ACCEL_MAX)
       if CC.actuators.longControlState == LongCtrlState.stopping:
-        accel = min(accel, CarControllerParams.BRAKE_ENTER_ACCEL)
-      braking = accel <= CarControllerParams.BRAKE_ENTER_ACCEL
-      if braking:
-        # Friction brake only. Torque goes to 0 Nm so it is not stacked with ACC_DECEL.
-        self.accel = accel
-        torque = 0.0
-        decel = self.accel
-      else:
-        # request = 122 * accel + 145, from the 2020 HD stock-ACC fit.
-        self.accel = accel
-        torque = CarControllerParams.TORQUE_FROM_ACCEL * accel + CarControllerParams.TORQUE_OFFSET
-        torque = min(max(torque, CarControllerParams.MIN_TORQUE_CMD), CarControllerParams.MAX_TORQUE_CMD)
-        decel = CarControllerParams.INACTIVE_DECEL
+        accel = min(accel, p.BRAKE_ENTER_ACCEL)
+      braking = accel <= p.BRAKE_ENTER_ACCEL
+      self.accel = accel
       active = True
+      torque_max = True
+      fuel_shutoff = True
+      if braking:
+        # Stock keeps about -80 Nm of engine request while ACC_DECEL is active.
+        torque = p.BRAKE_TORQUE
+        decel = self.accel
+        gr_max = 4 if self.accel <= p.HARD_BRAKE_DECEL else 0
+      else:
+        torque = p.TORQUE_FROM_ACCEL * accel + p.TORQUE_OFFSET
+        torque = min(max(torque, p.MIN_TORQUE_CMD), p.MAX_TORQUE_CMD)
+        decel = p.INACTIVE_DECEL
+        gr_max = 0
 
     sends = []
     # DAS_3 and DAS_5 are 50 Hz on this truck. DAS_3's counter is the real one.
     if self.frame % 2 == 0:
-      sends.append(chryslercan.create_das_3(self.packer, active, torque, decel, braking))
+      sends.append(chryslercan.create_das_3(self.packer, active, torque, decel, braking,
+                                            torque_max, fuel_shutoff, gr_max))
       sends.append(chryslercan.create_das_5(self.packer, CS.out.vEgo))
     # DAS_4 was ~17 Hz in the log. 10 Hz is enough for the set-speed display.
     if self.frame % 10 == 0:

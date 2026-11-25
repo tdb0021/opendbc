@@ -164,11 +164,13 @@ class ChryslerLongitudinalSafetyBase:
 
   Stock ACC does not engage. Resume, accel and decel do, on the falling edge.
   Cancel, and the brake pedal, disengage. Gas is an override: controls_allowed stays
-  set so lateral can continue, but longitudinal commands must be the inactive values.
+  set so lateral can continue. The torque request must then be inactive, or the
+  stock coast placeholder (about -90 Nm, ACC still active, max and fuel-shutoff bits off).
+  Positive torque is not combined with a friction-brake request. Negative torque is.
   """
 
-  # -100 Nm matches the safety floor. Stock coast on the 2020 HD reached -91 Nm.
-  MIN_ENGINE_TORQUE = -100.0
+  # -120 Nm is the safety floor. Deepest stock request was -98 Nm.
+  MIN_ENGINE_TORQUE = -120.0
   MAX_ENGINE_TORQUE = 500.0
   INACTIVE_ENGINE_TORQUE = 0.0
   MIN_POSSIBLE_ENGINE_TORQUE = -500.0
@@ -256,17 +258,44 @@ class ChryslerLongitudinalSafetyBase:
                                      self.MIN_POSSIBLE_DECEL, self.MAX_POSSIBLE_DECEL,
                                      test_delta=0.1, inactive_value=self.INACTIVE_DECEL)
 
-  def test_no_torque_and_brake_together(self):
-    self.safety.set_controls_allowed(True)
+  def _das3(self, **kwargs):
     values = {
-      "ACC_ACTIVE": 1,
-      "ENGINE_TORQUE_REQUEST": 100,
-      "ENGINE_TORQUE_REQUEST_MAX": 1,
-      "ACC_DECEL": -1.0,
-      "ACC_DECEL_REQ": 1,
-      "DISABLE_FUEL_SHUTOFF": 1,
+      "ENGINE_TORQUE_REQUEST": 0,
+      "ENGINE_TORQUE_REQUEST_MAX": 0,
+      "ACC_ACTIVE": 0,
+      "ACC_DECEL": self.INACTIVE_DECEL,
+      "ACC_DECEL_REQ": 0,
+      "DISABLE_FUEL_SHUTOFF": 0,
+      "GR_MAX_REQ": 0,
     }
-    self.assertFalse(self._tx(self.packer.make_can_msg_safety("DAS_3", self.LONG_BUS, values)))
+    values.update(kwargs)
+    return self.packer.make_can_msg_safety("DAS_3", self.LONG_BUS, values)
+
+  def test_no_positive_torque_with_brake(self):
+    # Positive torque stacked on ACC_DECEL can accelerate into a stop. Reject it.
+    # Stock does send about -80 Nm together with the friction brake. Allow that.
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=100, ENGINE_TORQUE_REQUEST_MAX=1,
+      ACC_DECEL=-1.0, ACC_DECEL_REQ=1, DISABLE_FUEL_SHUTOFF=1,
+    )))
+    self.assertTrue(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=-80, ENGINE_TORQUE_REQUEST_MAX=1,
+      ACC_DECEL=-2.5, ACC_DECEL_REQ=1, DISABLE_FUEL_SHUTOFF=1, GR_MAX_REQ=4,
+    )))
+    self.assertTrue(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=-80, ENGINE_TORQUE_REQUEST_MAX=1,
+      ACC_DECEL=-0.4, ACC_DECEL_REQ=1, DISABLE_FUEL_SHUTOFF=1, GR_MAX_REQ=0,
+    )))
+    # GR_MAX_REQ was 4 only while the hard brake was active, and never any other value.
+    self.assertFalse(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=100, ENGINE_TORQUE_REQUEST_MAX=1,
+      DISABLE_FUEL_SHUTOFF=1, GR_MAX_REQ=4,
+    )))
+    self.assertFalse(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=-80, ENGINE_TORQUE_REQUEST_MAX=1,
+      ACC_DECEL=-2.5, ACC_DECEL_REQ=1, DISABLE_FUEL_SHUTOFF=1, GR_MAX_REQ=2,
+    )))
 
   def test_stock_decel_sentinel(self):
     # Stock no-brake value is 3.9943 m/s^2 (raw 4093). 4.0 packs to a different raw.
@@ -276,15 +305,17 @@ class ChryslerLongitudinalSafetyBase:
       self.assertFalse(self._tx(self._decel_msg(4.0)))
 
   def test_stock_coast_torque_allowed(self):
-    # -91 Nm was the deepest stock coast. -100 is the floor. 532.5 was a cancel blip.
+    # Deepest stock request was -98 Nm. -120 is the floor. 937 Nm was a real kick
+    # and stays outside the 500 Nm ceiling, as does the 532.5 Nm cancel blip.
     self.safety.set_controls_allowed(True)
-    self.assertTrue(self._tx(self._torque_msg(-91)))
-    self.assertTrue(self._tx(self._torque_msg(-100)))
-    self.assertFalse(self._tx(self._torque_msg(-101)))
+    self.assertTrue(self._tx(self._torque_msg(-98)))
+    self.assertTrue(self._tx(self._torque_msg(-120)))
+    self.assertFalse(self._tx(self._torque_msg(-121)))
     self.assertFalse(self._tx(self._torque_msg(532.5)))
-    self.assertTrue(self._tx(self._torque_msg(422)))
+    self.assertFalse(self._tx(self._torque_msg(937)))
+    self.assertTrue(self._tx(self._torque_msg(480)))
     self.safety.set_controls_allowed(False)
-    self.assertFalse(self._tx(self._torque_msg(-91)))
+    self.assertFalse(self._tx(self._torque_msg(-98)))
 
   def test_fuel_shutoff_bit_only_while_allowed(self):
     self.safety.set_controls_allowed(True)
@@ -300,12 +331,37 @@ class ChryslerLongitudinalSafetyBase:
   def test_gas_override_blocks_longitudinal(self):
     self.safety.set_controls_allowed(True)
     self._rx(self._user_gas_msg(1))
-    # Lateral engagement stays; longitudinal actuation does not.
+    # Lateral engagement stays. The planner command does not: either a fully
+    # inactive frame, or the stock override (ACC on, coast torque, max bit off).
     self.assertTrue(self.safety.get_controls_allowed())
     self.assertFalse(self.safety.get_longitudinal_allowed())
     self.assertFalse(self._tx(self._torque_msg(100)))
     self.assertFalse(self._tx(self._decel_msg(-1.0)))
     self.assertTrue(self._tx(self._torque_msg(self.INACTIVE_ENGINE_TORQUE)))
+    self.assertTrue(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=-90, ENGINE_TORQUE_REQUEST_MAX=0,
+      DISABLE_FUEL_SHUTOFF=0,
+    )))
+    self.assertTrue(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=-50, ENGINE_TORQUE_REQUEST_MAX=0,
+    )))
+    self.assertTrue(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=-120, ENGINE_TORQUE_REQUEST_MAX=0,
+    )))
+    # The max bit, fuel-shutoff disable, positive torque, and a friction brake
+    # all drop during the override. The ECM follows the pedal, not this request.
+    self.assertFalse(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=-90, ENGINE_TORQUE_REQUEST_MAX=1,
+    )))
+    self.assertFalse(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=-90, DISABLE_FUEL_SHUTOFF=1,
+    )))
+    self.assertFalse(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=-49, ENGINE_TORQUE_REQUEST_MAX=0,
+    )))
+    self.assertFalse(self._tx(self._das3(
+      ACC_ACTIVE=1, ENGINE_TORQUE_REQUEST=200, ENGINE_TORQUE_REQUEST_MAX=0,
+    )))
     self._rx(self._user_gas_msg(0))
     self.assertTrue(self.safety.get_longitudinal_allowed())
     self.assertTrue(self._tx(self._torque_msg(100)))

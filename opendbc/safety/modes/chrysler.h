@@ -78,13 +78,14 @@ static uint32_t chrysler_cruise_button_addr = 0U;
 #define CHRYSLER_BTN_ENABLE  (CHRYSLER_BTN_ACCEL | CHRYSLER_BTN_DECEL | CHRYSLER_BTN_RESUME)
 
 // DAS_3 ENGINE_TORQUE_REQUEST: 13-bit Motorola at bit 4, 0.25 Nm, offset -500.
-// 2000 = 0 Nm, the value we send when not commanding.
-// 1600 = -100 Nm. Stock coast on a 2020 HD reached -91 Nm; -100 is the floor.
-// 4000 = 500 Nm. The observed controlled pull stayed under 422 Nm. 532.5 Nm was
-// one sample at a driver-brake cancel, not a pull, and stays outside this cap.
-#define CHRYSLER_TORQUE_INACTIVE  2000
-#define CHRYSLER_TORQUE_MIN       1600
-#define CHRYSLER_TORQUE_MAX       4000
+// 2000 = 0 Nm, sent when ACC is not engaged.
+// 1520 = -120 Nm. Deepest stock request was -98 Nm; -120 leaves a little room.
+// 1800 = -50 Nm, top of the gas-override coast band (stock sits near -90).
+// 4000 = 500 Nm. Stock did ask for 937 Nm on a kick; that stays outside this cap.
+#define CHRYSLER_TORQUE_INACTIVE      2000
+#define CHRYSLER_TORQUE_MIN           1520
+#define CHRYSLER_TORQUE_OVERRIDE_MAX  1800
+#define CHRYSLER_TORQUE_MAX           4000
 // DAS_3 ACC_DECEL: 12-bit Motorola at bit 19, 0.004885 m/s^2, offset -16.
 // Packer: -3.5 -> 2559, 0.0 -> 3275.
 // Stock "no brake" is raw 4093 = 3.9943 m/s^2, not the 4.0 that packs to 4094.
@@ -220,12 +221,12 @@ static bool chrysler_tx_hook(const CANPacket_t *msg) {
     }
   }
 
-  // Longitudinal actuation. DAS_3 carries engine torque and the friction-brake decel.
-  // Tuned against a 2020 Ram 2500 Cummins stock-ACC log (route 00000a3e--51571a2b07).
-  // Torque may be slightly negative: stock coasts that way, down to -91 Nm, with ACC_DECEL
-  // left at the +4 sentinel. Friction braking is a separate, shallow ACC_DECEL and is not
-  // combined with a torque command. 500 Nm remains the ceiling. The 532.5 Nm sample in that
-  // log was a single frame at a driver-brake cancel, not the controlled pull (max 422 Nm).
+  // Longitudinal actuation on DAS_3. Two 2020 HD stock-ACC logs
+  // (00000a3e--51571a2b07 and 00000a3f--f3c4bf6816):
+  // coast and braking both use a negative torque request, friction braking is
+  // ACC_DECEL down to about -2.75 m/s^2, and a gas pedal keeps ACC engaged while
+  // the request sits near -90 Nm. The safety ceiling stays 500 Nm. Stock did
+  // request 937 Nm on one kick; that is intentionally not allowed.
   if (msg->addr == CHRYSLER_ADDR(DAS_3)) {
     const LongitudinalLimits CHRYSLER_LONG_LIMITS = {
       .max_gas = CHRYSLER_TORQUE_MAX,
@@ -240,36 +241,51 @@ static bool chrysler_tx_hook(const CANPacket_t *msg) {
     const int decel = ((msg->data[2] & 0x0FU) << 8) | msg->data[3];
     const bool torque_req = GET_BIT(msg, 7U);
     const bool acc_active = GET_BIT(msg, 21U);
+    const bool fuel_shutoff_disable = (msg->data[2] & 0x80U) != 0U;
     const uint8_t decel_req = (uint8_t)((msg->data[4] >> 4) & 0x7U);
+    const uint8_t gr_max = msg->data[4] & 0x0FU;
     const bool torque_inactive = torque == CHRYSLER_LONG_LIMITS.inactive_gas;
     const bool decel_inactive = decel == CHRYSLER_LONG_LIMITS.inactive_accel;
+    const bool torque_positive = torque > CHRYSLER_LONG_LIMITS.inactive_gas;
+    // Pedal down while cruise is still engaged. Longitudinal commands are blocked,
+    // but stock does not drop ACC: it parks the request in a coast band.
+    const bool gas_override = controls_allowed && gas_pressed && !get_longitudinal_allowed();
 
     bool violation = false;
-    violation |= longitudinal_gas_checks(torque, CHRYSLER_LONG_LIMITS);
-    violation |= longitudinal_accel_checks(decel, CHRYSLER_LONG_LIMITS);
-    // Engine torque (including coast / engine-brake) and friction braking stay apart.
-    violation |= !torque_inactive && !decel_inactive;
-    // A friction-brake value is only meaningful while ACC is active.
-    violation |= !decel_inactive && !acc_active;
-    // Stock holds ENGINE_TORQUE_REQUEST_MAX for essentially the whole time ACC is active,
-    // including coast. It is not a "torque is positive" flag.
-    violation |= torque_req != acc_active;
-    violation |= (decel_req != 0U) != !decel_inactive;
-    violation |= decel_req > 1U;
-    // Bit 22 is unused on the logged truck. DISABLE_FUEL_SHUTOFF (bit 23) is set for
-    // ~96% of ACC-active time, so it is allowed only while longitudinal control is allowed.
-    violation |= (msg->data[2] & 0x40U) != 0U;
-    if (!get_longitudinal_allowed()) {
-      violation |= (msg->data[2] & 0x80U) != 0U;
-      violation |= acc_active;
-    }
-    // Stop/go bits were never set in the log. Do not command them.
-    violation |= GET_BIT(msg, 5U);               // ACC_STANDSTILL
-    violation |= GET_BIT(msg, 6U);               // ACC_GO
-    violation |= (msg->data[4] & 0x0FU) != 0U;   // GR_MAX_REQ
+    violation |= (msg->data[2] & 0x40U) != 0U;   // unused bit 22
+    violation |= GET_BIT(msg, 5U);               // ACC_STANDSTILL, never observed
+    violation |= GET_BIT(msg, 6U);               // ACC_GO, never observed
     violation |= (msg->data[4] & 0x80U) != 0U;   // unused
     violation |= msg->data[5] != 0U;             // ACC_FAULTED
-    violation |= (msg->data[6] & 0x0FU) != 0U;   // COLLISION_BRK_PREP, ACC_BRK_PREP, unused
+    violation |= (msg->data[6] & 0x0FU) != 0U;   // COLLISION_BRK_PREP, ACC_BRK_PREP
+    violation |= decel_req > 1U;
+    // Stock gear limit during the hard brake was 4, and 0 the rest of the time.
+    violation |= (gr_max != 0U) && (gr_max != 4U);
+    violation |= (gr_max == 4U) && decel_inactive;
+
+    if (gas_override) {
+      const bool inactive_frame = torque_inactive && decel_inactive && !acc_active && !torque_req &&
+                                  (decel_req == 0U) && !fuel_shutoff_disable && (gr_max == 0U);
+      const bool override_frame = decel_inactive && !torque_req && acc_active && (decel_req == 0U) &&
+                                  !fuel_shutoff_disable && (gr_max == 0U) &&
+                                  (torque >= CHRYSLER_TORQUE_MIN) && (torque <= CHRYSLER_TORQUE_OVERRIDE_MAX);
+      violation |= !(inactive_frame || override_frame);
+    } else {
+      violation |= longitudinal_gas_checks(torque, CHRYSLER_LONG_LIMITS);
+      violation |= longitudinal_accel_checks(decel, CHRYSLER_LONG_LIMITS);
+      // Positive torque stacked on the friction brake can accelerate into a stop.
+      // Negative torque with ACC_DECEL is how this truck brakes (about -80 Nm).
+      violation |= torque_positive && !decel_inactive;
+      violation |= !decel_inactive && !acc_active;
+      violation |= (decel_req != 0U) != !decel_inactive;
+      // While ACC is actually commanding, the max bit and the fuel-shutoff bit match it.
+      // Gas override is the exception, handled above: ACC stays on and both bits drop.
+      violation |= torque_req != acc_active;
+      if (!get_longitudinal_allowed()) {
+        violation |= fuel_shutoff_disable;
+        violation |= acc_active;
+      }
+    }
 
     if (violation) {
       tx = false;
